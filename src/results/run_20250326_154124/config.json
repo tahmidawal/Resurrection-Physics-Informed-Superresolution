@@ -1,0 +1,19 @@
+{
+    "batch_size": 32,
+    "num_epochs": 300,
+    "learning_rate": 0.0002,
+    "min_lr": 1e-06,
+    "warmup_epochs": 10,
+    "weight_decay": 2e-05,
+    "lambda_pde": 0.05,
+    "patience": 15,
+    "val_split": 0.15,
+    "grad_clip": 1.0,
+    "device": "cpu",
+    "num_workers": 4,
+    "pin_memory": true,
+    "save_interval": 50,
+    "use_physics_loss": true,
+    "use_data_augmentation": true,
+    "use_cosine_schedule": true
+}
