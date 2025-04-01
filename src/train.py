@@ -19,11 +19,12 @@ def train_model(
     criterion: nn.Module,
     optimizer: optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler,
+    warmup_scheduler: torch.optim.lr_scheduler.LambdaLR,
     num_epochs: int,
     device: str,
     save_dir: Path,
     writer: SummaryWriter,
-    grad_clip: float = 1.0
+    grad_clip: float = 0.1
 ) -> dict:
     """
     Train the model and save checkpoints.
@@ -34,7 +35,8 @@ def train_model(
         val_loader: Validation data loader
         criterion: Loss function
         optimizer: Optimizer
-        scheduler: Learning rate scheduler
+        scheduler: Main learning rate scheduler
+        warmup_scheduler: Warmup learning rate scheduler
         num_epochs: Number of epochs to train
         device: Device to train on
         save_dir: Directory to save checkpoints
@@ -84,8 +86,12 @@ def train_model(
         
         val_loss /= len(val_loader)
         
-        # Step the scheduler
-        scheduler.step(val_loss)
+        # Step the schedulers
+        if epoch < 5:  # During warmup
+            warmup_scheduler.step()
+        else:  # After warmup
+            scheduler.step(val_loss)
+        
         current_lr = optimizer.param_groups[0]['lr']
         
         # Log metrics
@@ -109,6 +115,7 @@ def train_model(
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
+                'warmup_scheduler_state_dict': warmup_scheduler.state_dict(),
                 'train_loss': train_loss,
                 'val_loss': val_loss
             }
@@ -143,16 +150,16 @@ def main():
     
     # Configuration
     config = {
-        'batch_size': 32,
+        'batch_size': 16,
         'num_epochs': 500,
-        'learning_rate': 2e-4,
-        'min_lr': 1e-6,
-        'patience': 10,
+        'learning_rate': 5e-5,
+        'min_lr': 1e-7,
+        'patience': 15,
         'val_split': 0.2,
-        'grad_clip': 1.0,
+        'grad_clip': 0.1,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'num_workers': 4,  # Number of workers for data loading
-        'pin_memory': True  # Faster data transfer to GPU
+        'num_workers': 4,
+        'pin_memory': True
     }
     
     # Create directories
@@ -170,7 +177,7 @@ def main():
     
     # Load data
     print("Loading dataset...")
-    data = np.load('data/pde_dataset.npz')
+    data = np.load('data/pde_dataset_subdomains.npz')
     
     # Create a random permutation of indices
     n_samples = len(data['u_fine'])
@@ -189,8 +196,8 @@ def main():
     print(f"Validation samples: {len(val_indices)}")
     
     # Create datasets
-    train_dataset = PDEDataset(train_data, device=config['device'])
-    val_dataset = PDEDataset(val_data, device=config['device'])
+    train_dataset = PDEDataset(train_data, device='cpu')  # Initialize on CPU
+    val_dataset = PDEDataset(val_data, device='cpu')      # Initialize on CPU
     
     # Create data loaders with shuffling for training
     train_loader = DataLoader(
@@ -204,27 +211,43 @@ def main():
     val_loader = DataLoader(
         val_dataset,
         batch_size=config['batch_size'],
-        shuffle=False,  # No need to shuffle validation data
+        shuffle=False,
         num_workers=config['num_workers'],
         pin_memory=config['pin_memory']
     )
     
     # Initialize model
-    model = UNet().to(config['device'])
+    model = UNet(in_channels=2).to(config['device'])  # Updated to 2 input channels
     model.apply(init_weights)
     
-    # Loss function and optimizer
+    # Loss function and optimizer with modified parameters
     criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-4)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config['learning_rate'],
+        weight_decay=1e-6,
+        betas=(0.9, 0.99)
+    )
     
-    # Learning rate scheduler
+    # Learning rate scheduler with larger reduction factor
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='min',
-        factor=0.5,
+        factor=0.2,
         patience=config['patience'],
         min_lr=config['min_lr'],
         verbose=True
+    )
+    
+    # Warmup scheduler (corrected lambda function)
+    def warmup_lambda(epoch):
+        if epoch < 5:
+            return epoch / 5  # Linear warmup
+        return 1.0
+    
+    warmup_scheduler = optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=warmup_lambda
     )
     
     # Train model
@@ -236,6 +259,7 @@ def main():
         criterion=criterion,
         optimizer=optimizer,
         scheduler=scheduler,
+        warmup_scheduler=warmup_scheduler,
         num_epochs=config['num_epochs'],
         device=config['device'],
         save_dir=save_dir,

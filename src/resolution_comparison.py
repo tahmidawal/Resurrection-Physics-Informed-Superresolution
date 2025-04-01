@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import argparse
 from typing import Dict, List, Tuple
+import time
 
 def solve_multi_resolution(n_coarse: int = 40, resolutions: List[int] = [80, 160, 320, 640]):
     """
@@ -34,7 +35,9 @@ def solve_multi_resolution(n_coarse: int = 40, resolutions: List[int] = [80, 160
     y = np.linspace(0, 1, n_finest)
     X, Y = np.meshgrid(x, y)
     f_finest = np.sin(k1 * 2 * np.pi * X) * np.sin(k2 * 2 * np.pi * Y)
-    theta_finest = np.random.uniform(0.5, 2.0, size=(n_finest, n_finest))
+    
+    # Use constant theta=1.0 instead of random values
+    theta_finest = np.ones((n_finest, n_finest))
     
     # Initialize data dictionary
     data = {
@@ -55,7 +58,7 @@ def solve_multi_resolution(n_coarse: int = 40, resolutions: List[int] = [80, 160
         else:
             step = n_finest // res
             data['f'][res] = f_finest[::step, ::step]
-            data['theta'][res] = theta_finest[::step, ::step]
+            data['theta'][res] = theta_finest[::step, ::step]  # Still constant = 1.0
         
         # Solve PDE
         if res == n_coarse:
@@ -86,16 +89,10 @@ def upscale_subdomain(model: torch.nn.Module, u_coarse: np.ndarray,
     # Convert inputs to tensors
     u_coarse = torch.from_numpy(u_coarse).float().to(device)
     f_fine = torch.from_numpy(f_fine).float().to(device)
-    theta_fine = torch.from_numpy(theta_fine).float().to(device)
     
     # Normalize using global statistics
     u_coarse_norm = (u_coarse - global_norm.u_mean) / global_norm.u_std
     f_fine_norm = (f_fine - global_norm.f_mean) / global_norm.f_std
-    
-    if global_norm.theta_is_constant:
-        theta_fine_norm = theta_fine
-    else:
-        theta_fine_norm = (theta_fine - global_norm.theta_mean) / global_norm.theta_std
     
     # Upsample coarse solution
     u_coarse_upsampled = F.interpolate(
@@ -105,20 +102,22 @@ def upscale_subdomain(model: torch.nn.Module, u_coarse: np.ndarray,
         align_corners=True
     )
     
-    # Combine inputs
+    # Combine inputs (only coarse solution and f)
     inputs = torch.cat([
         u_coarse_upsampled.squeeze(0),
-        theta_fine_norm.unsqueeze(0),
         f_fine_norm.unsqueeze(0)
     ], dim=0)
     
     # Get model prediction
     with torch.no_grad():
+        start_time = time.time()
         prediction = model(inputs.unsqueeze(0))
-        prediction = prediction * global_norm.u_std + global_norm.u_mean
-        prediction = prediction.squeeze().cpu().numpy()
+        inference_time = time.time() - start_time
+        
+    prediction = prediction * global_norm.u_std + global_norm.u_mean
+    prediction = prediction.squeeze().cpu().numpy()
     
-    return prediction
+    return prediction, inference_time
 
 def split_into_subdomains(array: np.ndarray, subdomain_size: int) -> list:
     """Split a 2D array into subdomains."""
@@ -159,34 +158,28 @@ def stitch_subdomains(subdomains: list) -> np.ndarray:
 
 class GlobalNormalization:
     """Compute and store global normalization statistics."""
-    def __init__(self, u_fine, u_coarse, f_fine, theta_fine):
+    def __init__(self, u_fine, u_coarse, f_fine):
         # Convert to tensors
         u_fine = torch.from_numpy(u_fine).float()
         u_coarse = torch.from_numpy(u_coarse).float()
         f_fine = torch.from_numpy(f_fine).float()
-        theta_fine = torch.from_numpy(theta_fine).float()
         
         # Compute statistics
         self.u_mean = u_fine.mean()
         self.u_std = u_fine.std()
         self.f_mean = f_fine.mean()
         self.f_std = f_fine.std()
-        
-        self.theta_is_constant = (theta_fine.std() < 1e-6)
-        if self.theta_is_constant:
-            self.theta_mean = 0
-            self.theta_std = 1
-        else:
-            self.theta_mean = theta_fine.mean()
-            self.theta_std = theta_fine.std()
 
 def ml_multi_level_upscale(model: torch.nn.Module, data: dict, 
-                          target_resolution: int, device: str) -> np.ndarray:
+                          target_resolution: int, device: str) -> tuple:
     """
     Perform multi-level upscaling using ML model from 40x40 to target resolution.
+    Returns the upscaled solution and timing information.
     """
     current_res = 40
     current_solution = data['u'][current_res]
+    total_inference_time = 0
+    total_predictions = 0
     
     while current_res < target_resolution:
         next_res = current_res * 2
@@ -196,37 +189,55 @@ def ml_multi_level_upscale(model: torch.nn.Module, data: dict,
         global_norm = GlobalNormalization(
             data['u'][next_res],  # fine solution (ground truth)
             current_solution,      # coarse solution (current)
-            data['f'][next_res],  # fine forcing
-            data['theta'][next_res]  # fine theta
+            data['f'][next_res]    # fine forcing
         )
         
         # Split into 20x20 subdomains
         n_subdomains = current_res // 20
         coarse_subdomains = split_into_subdomains(current_solution, 20)
         f_subdomains = split_into_subdomains(data['f'][next_res], 40)
-        theta_subdomains = split_into_subdomains(data['theta'][next_res], 40)
         
         # Process each subdomain
         upscaled_subdomains = []
+        level_inference_time = 0
+        level_predictions = 0
+        
         for i in range(n_subdomains):
             row = []
             for j in range(n_subdomains):
-                prediction = upscale_subdomain(
+                prediction, inference_time = upscale_subdomain(
                     model,
                     coarse_subdomains[i][j],
                     f_subdomains[i][j],
-                    theta_subdomains[i][j],
+                    None,  # We're not using theta anymore
                     global_norm,
                     device
                 )
                 row.append(prediction)
+                
+                # Track timing
+                level_inference_time += inference_time
+                level_predictions += 1
+                
             upscaled_subdomains.append(row)
+        
+        # Update timing stats
+        total_inference_time += level_inference_time
+        total_predictions += level_predictions
+        
+        # Print timing for this level
+        avg_time_ms = (level_inference_time / level_predictions) * 1000
+        print(f"Level {current_res}→{next_res} timing: {avg_time_ms:.2f} ms per 40×40 prediction (total: {level_predictions} predictions)")
         
         # Update for next iteration
         current_solution = stitch_subdomains(upscaled_subdomains)
         current_res = next_res
     
-    return current_solution
+    # Calculate and return overall average
+    avg_time_ms = (total_inference_time / total_predictions) * 1000
+    print(f"\nOverall ML timing: {avg_time_ms:.2f} ms per 40×40 prediction (total: {total_predictions} predictions)")
+    
+    return current_solution, avg_time_ms
 
 def plot_resolution_comparison(data: dict, ml_solutions: dict, 
                              bilinear_solutions: dict, save_dir: Path):
@@ -286,7 +297,7 @@ def plot_resolution_comparison(data: dict, ml_solutions: dict,
     
     # Create detailed comparison plots for each resolution
     for res in resolutions:
-        fig = plt.figure(figsize=(20, 15))
+        fig = plt.figure(figsize=(20, 20))
         plt.suptitle(f'Solution Comparison at {res}x{res}', fontsize=16)
         
         # Use consistent normalization
@@ -294,44 +305,56 @@ def plot_resolution_comparison(data: dict, ml_solutions: dict,
         vmax = max(data['u'][res].max(), ml_solutions[res].max(), bilinear_solutions[res].max())
         
         # Ground truth
-        ax1 = plt.subplot(231)
+        ax1 = plt.subplot(331)
         im1 = ax1.imshow(data['u'][res], vmin=vmin, vmax=vmax)
         ax1.set_title(f'Ground Truth ({res}x{res})')
         plt.colorbar(im1, ax=ax1)
         
         # ML solution
-        ax2 = plt.subplot(232)
+        ax2 = plt.subplot(332)
         im2 = ax2.imshow(ml_solutions[res], vmin=vmin, vmax=vmax)
         ml_mae = np.mean(np.abs(ml_solutions[res] - data['u'][res]))
         ax2.set_title(f'ML Multi-level\nMAE: {ml_mae:.6f}')
         plt.colorbar(im2, ax=ax2)
         
         # Bilinear solution
-        ax3 = plt.subplot(233)
+        ax3 = plt.subplot(333)
         im3 = ax3.imshow(bilinear_solutions[res], vmin=vmin, vmax=vmax)
         bl_mae = np.mean(np.abs(bilinear_solutions[res] - data['u'][res]))
         ax3.set_title(f'Direct Bilinear\nMAE: {bl_mae:.6f}')
         plt.colorbar(im3, ax=ax3)
         
         # Error plots
-        ax4 = plt.subplot(234)
+        ax4 = plt.subplot(334)
         error_ml = np.abs(ml_solutions[res] - data['u'][res])
         im4 = ax4.imshow(error_ml)
         ax4.set_title('ML Error')
         plt.colorbar(im4, ax=ax4)
         
-        ax5 = plt.subplot(235)
+        ax5 = plt.subplot(335)
         error_bl = np.abs(bilinear_solutions[res] - data['u'][res])
         im5 = ax5.imshow(error_bl)
         ax5.set_title('Bilinear Error')
         plt.colorbar(im5, ax=ax5)
         
         # Error difference
-        ax6 = plt.subplot(236)
+        ax6 = plt.subplot(336)
         error_diff = error_ml - error_bl
         im6 = ax6.imshow(error_diff, cmap='RdBu')
         ax6.set_title('Error Difference\n(Blue: ML better)')
         plt.colorbar(im6, ax=ax6)
+
+        # Theta plot
+        ax7 = plt.subplot(337)
+        im7 = ax7.imshow(data['theta'][res])
+        ax7.set_title(f'Theta ({res}x{res})')
+        plt.colorbar(im7, ax=ax7)
+
+        # Forcing term plot
+        ax8 = plt.subplot(338)
+        im8 = ax8.imshow(data['f'][res])
+        ax8.set_title(f'Forcing Term ({res}x{res})')
+        plt.colorbar(im8, ax=ax8)
         
         plt.tight_layout()
         plt.savefig(save_dir / f'comparison_{res}x{res}.png', dpi=300, bbox_inches='tight')
@@ -399,6 +422,8 @@ def main():
     # Initialize solution dictionaries
     ml_solutions = {}
     bilinear_solutions = {}
+    ml_timing_ms = {}
+    bilinear_timing_ms = {}
     
     # Perform upscaling for each target resolution
     for res in resolutions:
@@ -406,18 +431,22 @@ def main():
         
         # ML multi-level upscaling
         print("\nPerforming ML multi-level upscaling...")
-        ml_solutions[res] = ml_multi_level_upscale(
+        ml_solutions[res], ml_timing_ms[res] = ml_multi_level_upscale(
             model, data, res, device
         )
         
         # Direct bilinear upscaling
         print("\nPerforming direct bilinear upscaling...")
+        start_time = time.time()
         bilinear_solutions[res] = F.interpolate(
             torch.from_numpy(data['u'][40]).float().unsqueeze(0).unsqueeze(0),
             size=(res, res),
             mode='bilinear',
             align_corners=True
         ).squeeze().numpy()
+        bilinear_time = time.time() - start_time
+        bilinear_timing_ms[res] = bilinear_time * 1000
+        print(f"Bilinear timing: {bilinear_timing_ms[res]:.2f} ms for full {res}×{res} upscaling")
         
         # Calculate metrics
         ml_mae = np.mean(np.abs(ml_solutions[res] - data['u'][res]))
@@ -427,8 +456,15 @@ def main():
         bl_rmse = np.sqrt(np.mean((bilinear_solutions[res] - data['u'][res])**2))
         
         print(f"\nResults for {res}x{res}:")
-        print(f"ML Multi-level - MAE: {ml_mae:.6f}, RMSE: {ml_rmse:.6f}")
-        print(f"Direct Bilinear - MAE: {bl_mae:.6f}, RMSE: {bl_rmse:.6f}")
+        print(f"ML Multi-level - MAE: {ml_mae:.6f}, RMSE: {ml_rmse:.6f}, Avg Time: {ml_timing_ms[res]:.2f} ms per 40×40 patch")
+        print(f"Direct Bilinear - MAE: {bl_mae:.6f}, RMSE: {bl_rmse:.6f}, Time: {bilinear_timing_ms[res]:.2f} ms total")
+    
+    # Print timing summary
+    print("\n===== ML Inference Timing Summary =====")
+    print("Resolution | Avg Time per 40×40 patch (ms)")
+    print("----------------------------------------")
+    for res in resolutions:
+        print(f"{res}×{res} | {ml_timing_ms[res]:.2f} ms")
     
     # Create comparison plots
     plot_resolution_comparison(data, ml_solutions, bilinear_solutions, results_dir)

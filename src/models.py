@@ -24,12 +24,12 @@ class ConvBlock(nn.Module):
         return x
 
 class UNet(nn.Module):
-    def __init__(self, in_channels: int = 3):
+    def __init__(self, in_channels: int = 2):
         """
         Enhanced U-Net architecture for PDE solution upscaling.
         
         Args:
-            in_channels: Number of input channels (coarse solution + theta + f)
+            in_channels: Number of input channels (coarse solution + f)
         """
         super().__init__()
         
@@ -72,7 +72,7 @@ class UNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Split input channels
         coarse_solution = x[:, 0:1, :, :]
-        features = x[:, 1:, :, :]
+        features = x[:, 1:, :, :]  # Now only contains f
         
         # Encoder
         e1 = self.enc1(x)                    # 40×40
@@ -144,21 +144,17 @@ class PDEDataset(torch.utils.data.Dataset):
         self.u_coarse = torch.from_numpy(data_dict['u_coarse']).float().to(device)
         self.u_fine = torch.from_numpy(data_dict['u_fine']).float().to(device)
         self.f_fine = torch.from_numpy(data_dict['f_fine']).float().to(device)
-        self.theta_fine = torch.from_numpy(data_dict['theta_fine']).float().to(device)
         
         # Compute normalization statistics
         self.u_mean = self.u_fine.mean()
         self.u_std = self.u_fine.std()
         self.f_mean = self.f_fine.mean()
         self.f_std = self.f_fine.std()
-        self.theta_mean = self.theta_fine.mean()
-        self.theta_std = self.theta_fine.std()
         
         # Normalize the data
         self.u_fine_norm = (self.u_fine - self.u_mean) / self.u_std
         self.u_coarse_norm = (self.u_coarse - self.u_mean) / self.u_std
         self.f_fine_norm = (self.f_fine - self.f_mean) / self.f_std
-        self.theta_fine_norm = (self.theta_fine - self.theta_mean) / self.theta_std
         
         # Upsample coarse solution to fine grid
         self.u_coarse_upsampled = F.interpolate(
@@ -172,10 +168,9 @@ class PDEDataset(torch.utils.data.Dataset):
         return len(self.u_fine)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Combine normalized inputs: [upsampled_coarse_solution, theta, f]
+        # Combine normalized inputs: [upsampled_coarse_solution, f]
         x = torch.cat([
             self.u_coarse_upsampled[idx],
-            self.theta_fine_norm[idx].unsqueeze(0),
             self.f_fine_norm[idx].unsqueeze(0)
         ], dim=0)
         

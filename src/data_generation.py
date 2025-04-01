@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Tuple, List
 import matplotlib.pyplot as plt
+import random
 
 class PoissonSolver:
     def __init__(self, n_coarse: int = 20, n_fine: int = 40):
@@ -213,4 +214,48 @@ if __name__ == '__main__':
     
     plt.tight_layout()
     plt.savefig(results_dir / 'example_solution.png')
-    plt.close() 
+    plt.close()
+
+    # Create dataset_samples directory if it doesn't exist
+    samples_dir = Path('dataset_samples')
+    if not samples_dir.exists():
+        samples_dir.mkdir(parents=True)
+
+    # Plot 10 random samples
+    sample_indices = random.sample(range(n_samples), 10)
+    for i, idx in enumerate(sample_indices):
+        plt.figure(figsize=(15, 10))
+
+        plt.subplot(231)
+        plt.imshow(dataset['u_coarse'][idx])
+        plt.colorbar()
+        plt.title(f'Coarse Solution (Sample {idx})')
+
+        plt.subplot(232)
+        plt.imshow(dataset['u_fine'][idx])
+        plt.colorbar()
+        plt.title(f'Fine Solution (Sample {idx})')
+
+        plt.subplot(233)
+        plt.imshow(dataset['f_coarse'][idx])
+        plt.colorbar()
+        plt.title(f'Forcing Term Coarse (Sample {idx})')
+
+        plt.subplot(234)
+        plt.imshow(dataset['f_fine'][idx])
+        plt.colorbar()
+        plt.title(f'Forcing Term Fine (Sample {idx})')
+
+        plt.subplot(235)
+        plt.imshow(dataset['theta_coarse'][idx])
+        plt.colorbar()
+        plt.title(f'Theta Coarse (Sample {idx})')
+
+        plt.subplot(236)
+        plt.imshow(dataset['theta_fine'][idx])
+        plt.colorbar()
+        plt.title(f'Theta Fine (Sample {idx})')
+
+        plt.tight_layout()
+        plt.savefig(samples_dir / f'sample_{i}.png')
+        plt.close() 
