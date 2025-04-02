@@ -113,7 +113,7 @@ def extract_subdomains(field: np.ndarray, grid_size: int, num_subdomains: int) -
     
     return subdomains
 
-def generate_dataset_part1(n_samples: int, k_range: Tuple[float, float] = (8.0, 10.0)) -> Dict:
+def generate_dataset_part1(n_samples: int, k_values: List[float] = [4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0]) -> Dict:
     """
     Generate dataset with the first approach:
     1. Generate u and f in 40x40 (coarse) and 80x80 (fine)
@@ -144,9 +144,10 @@ def generate_dataset_part1(n_samples: int, k_range: Tuple[float, float] = (8.0, 
     
     # Generate samples
     for _ in range(n_samples):
-        # Generate random wave numbers
-        k1 = np.random.uniform(*k_range)
-        k2 = np.random.uniform(*k_range)
+        # Select k values from the predefined list
+        k_idx = _ % len(k_values)  # Cycle through k values
+        k1 = k_values[k_idx]
+        k2 = k_values[k_idx]  # Using same k value for both dimensions
         
         # Set constant theta
         theta_coarse = np.ones((40, 40))
@@ -185,7 +186,7 @@ def generate_dataset_part1(n_samples: int, k_range: Tuple[float, float] = (8.0, 
         
     return dataset
 
-def generate_dataset_part2(n_samples: int, k_range: Tuple[float, float] = (8.0, 10.0)) -> Dict:
+def generate_dataset_part2(n_samples: int, k_values: List[float] = [4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0]) -> Dict:
     """
     Generate dataset with the second approach:
     1. Generate u and f in 80x80 and 160x160
@@ -216,9 +217,10 @@ def generate_dataset_part2(n_samples: int, k_range: Tuple[float, float] = (8.0, 
     
     # Generate samples
     for _ in range(n_samples):
-        # Generate random wave numbers
-        k1 = np.random.uniform(*k_range)
-        k2 = np.random.uniform(*k_range)
+        # Select k values from the predefined list
+        k_idx = _ % len(k_values)  # Cycle through k values
+        k1 = k_values[k_idx]
+        k2 = k_values[k_idx]  # Using same k value for both dimensions
         
         # Set constant theta
         theta_coarse = np.ones((80, 80))
@@ -352,18 +354,18 @@ if __name__ == '__main__':
     
     # Part 1: Generate datasets from 40x40 and 80x80 grids
     n_samples_part1 = 625  # 625 × 4 subdomains = 2500 samples
-    k_range = (8.0, 10.0)
+    k_values = [4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0]
     
-    print(f"Part 1: Generating {n_samples_part1} samples (40x40 → 80x80) with k_range {k_range}...")
+    print(f"Part 1: Generating {n_samples_part1} samples (40x40 → 80x80) with k_values {k_values}...")
     print(f"This will produce {n_samples_part1 * 4} subdomain samples (20x20 → 40x40)")
-    dataset_part1 = generate_dataset_part1(n_samples_part1, k_range)
+    dataset_part1 = generate_dataset_part1(n_samples_part1, k_values)
     
     # Part 2: Generate datasets from 80x80 and 160x160 grids
     n_samples_part2 = 219  # 219 × 16 subdomains ≈ 3500 samples (actually 3504)
     
-    print(f"Part 2: Generating {n_samples_part2} samples (80x80 → 160x160) with k_range {k_range}...")
+    print(f"Part 2: Generating {n_samples_part2} samples (80x80 → 160x160) with k_values {k_values}...")
     print(f"This will produce {n_samples_part2 * 16} subdomain samples (20x20 → 40x40)")
-    dataset_part2 = generate_dataset_part2(n_samples_part2, k_range)
+    dataset_part2 = generate_dataset_part2(n_samples_part2, k_values)
     
     # Combine datasets
     combined_dataset = combine_datasets(dataset_part1, dataset_part2)

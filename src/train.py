@@ -12,6 +12,71 @@ from torch.utils.tensorboard import SummaryWriter
 
 from models import UNet, PDEDataset, init_weights
 
+class BoundaryAwareLoss(nn.Module):
+    def __init__(self, boundary_weight=2.0, subdomain_size=40, boundary_width=3):
+        """Loss function that gives higher weight to errors at subdomain boundaries.
+        
+        Args:
+            boundary_weight: Weight multiplier for boundary regions
+            subdomain_size: Size of subdomains used during inference
+            boundary_width: Width of boundary region on each side of subdomain
+        """
+        super().__init__()
+        self.boundary_weight = boundary_weight
+        self.subdomain_size = subdomain_size
+        self.boundary_width = boundary_width
+        self.base_criterion = nn.MSELoss(reduction='none')
+        
+    def forward(self, pred, target):
+        # Calculate base loss (pixel-wise MSE)
+        base_loss = self.base_criterion(pred, target)
+        
+        # Create boundary weight mask - higher weights near boundaries
+        mask = torch.ones_like(pred)
+        
+        # Increase weight for pixels near subdomain boundaries
+        for i in range(0, pred.shape[2], self.subdomain_size):
+            if i > 0:  # Skip first boundary
+                # Left boundary of subdomain
+                start_idx = max(0, i - self.boundary_width)
+                end_idx = min(pred.shape[2], i + self.boundary_width)
+                mask[:, :, start_idx:end_idx, :] *= self.boundary_weight
+                
+        for j in range(0, pred.shape[3], self.subdomain_size):
+            if j > 0:  # Skip first boundary
+                # Top boundary of subdomain
+                start_idx = max(0, j - self.boundary_width)
+                end_idx = min(pred.shape[3], j + self.boundary_width)
+                mask[:, :, :, start_idx:end_idx] *= self.boundary_weight
+        
+        # Apply mask and reduce
+        weighted_loss = (base_loss * mask).mean()
+        return weighted_loss
+
+class MultiScaleConsistencyLoss(nn.Module):
+    def __init__(self, alpha=0.2):
+        """Multi-scale consistency loss.
+        
+        Args:
+            alpha: Weight for consistency loss component
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.base_criterion = nn.MSELoss()
+        
+    def forward(self, pred, target, coarse_input):
+        # Base reconstruction loss
+        recon_loss = self.base_criterion(pred, target)
+        
+        # Downsample the prediction to coarse resolution
+        downsampled = F.avg_pool2d(pred, kernel_size=2, stride=2)
+        
+        # Consistency loss between downsampled prediction and coarse input
+        consistency_loss = self.base_criterion(downsampled, coarse_input[:, 0:1])
+        
+        # Combined loss
+        return recon_loss + self.alpha * consistency_loss
+
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -64,10 +129,17 @@ def train_model(
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             
+            # Uncomment for multi-scale consistency loss (optional enhancement)
+            # if isinstance(criterion, MultiScaleConsistencyLoss):
+            #     loss = criterion(outputs, targets, inputs)
+            
             loss.backward()
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            # Free up GPU memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             train_loss += loss.item()
         
@@ -146,21 +218,35 @@ def main():
     # Set random seeds for reproducibility
     torch.manual_seed(42)
     np.random.seed(42)
-    torch.cuda.manual_seed(42)
+    
+    # Check and print GPU availability
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\nUsing device: {device}")
+    
+    if device == 'cuda':
+        print(f"GPU detected: {torch.cuda.get_device_name(0)}")
+        print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        torch.cuda.manual_seed(42)
+    else:
+        print("WARNING: No GPU detected, training will be slow!")
     
     # Configuration
     config = {
-        'batch_size': 16,
+        'batch_size': 4,  # Reduced batch size for GPU memory efficiency
         'num_epochs': 500,
         'learning_rate': 5e-5,
         'min_lr': 1e-7,
         'patience': 15,
         'val_split': 0.2,
         'grad_clip': 0.1,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'num_workers': 4,
-        'pin_memory': True
+        'device': device,  # Use the already validated device
+        'num_workers': 1,  # Single worker to avoid memory issues
+        'pin_memory': True if device == 'cuda' else False  # Only pin memory for GPU
     }
+    
+    # Enable cuDNN benchmarking for faster training on GPU
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
     
     # Create directories
     base_dir = Path('results')
@@ -177,7 +263,12 @@ def main():
     
     # Load data
     print("Loading dataset...")
-    data = np.load('data/pde_dataset_subdomains.npz')
+    try:
+        data = np.load('data/pde_dataset_subdomains.npz')
+        print(f"Dataset loaded successfully, size: {sum(data[key].nbytes for key in data.files) / 1e6:.2f} MB")
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        raise
     
     # Create a random permutation of indices
     n_samples = len(data['u_fine'])
@@ -195,9 +286,10 @@ def main():
     print(f"Training samples: {len(train_indices)}")
     print(f"Validation samples: {len(val_indices)}")
     
-    # Create datasets
-    train_dataset = PDEDataset(train_data, device='cpu')  # Initialize on CPU
-    val_dataset = PDEDataset(val_data, device='cpu')      # Initialize on CPU
+    # Create datasets (always initialize on CPU to avoid OOM during loading)
+    train_dataset = PDEDataset(train_data, device='cpu')  
+    val_dataset = PDEDataset(val_data, device='cpu')
+    print("Datasets created successfully")
     
     # Create data loaders with shuffling for training
     train_loader = DataLoader(
@@ -217,11 +309,17 @@ def main():
     )
     
     # Initialize model
+    print(f"\nInitializing UNet model on {config['device']}...")
     model = UNet(in_channels=2).to(config['device'])  # Updated to 2 input channels
     model.apply(init_weights)
     
-    # Loss function and optimizer with modified parameters
-    criterion = nn.MSELoss()
+    # Print model summary
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model initialized with {trainable_params:,} trainable parameters (total: {total_params:,})")
+    
+    # Enhanced loss function for better boundary handling
+    criterion = BoundaryAwareLoss(boundary_weight=2.0, subdomain_size=40, boundary_width=3)
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config['learning_rate'],

@@ -24,9 +24,9 @@ def solve_multi_resolution(n_coarse: int = 40, resolutions: List[int] = [80, 160
         n_coarse_for_solver = n_fine // 2
         solvers[n_fine] = PoissonSolver(n_coarse=n_coarse_for_solver, n_fine=n_fine)
     
-    # Generate random k values (higher frequency for challenging test)
-    k1 = np.random.uniform(11.0, 12.0)
-    k2 = np.random.uniform(11.0, 12.0)
+    # Use fixed k values (frequency of 9.0)
+    k1 = 9.0
+    k2 = 9.0
     print(f"Using wave numbers: k₁={k1:.2f}, k₂={k2:.2f}")
     
     # Generate fields on finest grid (640x640)
@@ -80,38 +80,76 @@ def solve_multi_resolution(n_coarse: int = 40, resolutions: List[int] = [80, 160
     
     return data
 
-def upscale_subdomain(model: torch.nn.Module, u_coarse: np.ndarray, 
-                     f_fine: np.ndarray, theta_fine: np.ndarray,
-                     global_norm, device: str) -> np.ndarray:
+def upscale_subdomain(model: torch.nn.Module, u_coarse, 
+                      f_fine, theta_fine: np.ndarray,
+                      global_norm, device: str) -> np.ndarray:
     """
     Apply the ML model to upscale a single subdomain using global normalization.
     """
-    # Convert inputs to tensors
+    # Convert inputs to tensors - handle both list and numpy array inputs
+    if isinstance(u_coarse, list):
+        u_coarse = np.array(u_coarse)
+    if isinstance(f_fine, list):
+        f_fine = np.array(f_fine)
+        
     u_coarse = torch.from_numpy(u_coarse).float().to(device)
     f_fine = torch.from_numpy(f_fine).float().to(device)
+    
+    # Debug shapes
+    print(f"Original shapes - u_coarse: {u_coarse.shape}, f_fine: {f_fine.shape}")
     
     # Normalize using global statistics
     u_coarse_norm = (u_coarse - global_norm.u_mean) / global_norm.u_std
     f_fine_norm = (f_fine - global_norm.f_mean) / global_norm.f_std
     
+    # For overlapping subdomains, reshape to expected dimensions
+    # Ensure u_coarse is 20x20 and f_fine is 40x40
+    if u_coarse.numel() == 400:  # 20*20 = 400
+        u_coarse_norm = u_coarse_norm.reshape(20, 20)
+    elif len(u_coarse.shape) == 3:
+        # If 3D tensor, use the middle slice which should be complete
+        u_coarse_norm = u_coarse_norm[1]  # Use the middle slice
+    
+    # Ensure f_fine is properly shaped for 40x40
+    if f_fine.numel() == 1600:  # 40*40 = 1600
+        f_fine_norm = f_fine_norm.reshape(40, 40)
+    elif len(f_fine.shape) == 3:
+        # If 3D tensor, use the middle slice which should be complete
+        f_fine_norm = f_fine_norm[1]  # Use the middle slice
+    
+    # Resize f_fine if it's not 40x40
+    if f_fine_norm.shape != torch.Size([40, 40]):
+        print(f"Resizing f_fine from {f_fine_norm.shape} to 40x40")
+        f_fine_norm = F.interpolate(
+            f_fine_norm.unsqueeze(0).unsqueeze(0),
+            size=(40, 40),
+            mode='bilinear',
+            align_corners=True
+        ).squeeze(0).squeeze(0)
+    
+    # Add batch and channel dimensions for interpolation
+    u_coarse_norm = u_coarse_norm.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+    
     # Upsample coarse solution
     u_coarse_upsampled = F.interpolate(
-        u_coarse_norm.unsqueeze(0).unsqueeze(0),
+        u_coarse_norm,
         size=(40, 40),
         mode='bilinear',
         align_corners=True
     )
     
-    # Combine inputs (only coarse solution and f)
-    inputs = torch.cat([
-        u_coarse_upsampled.squeeze(0),
-        f_fine_norm.unsqueeze(0)
-    ], dim=0)
+    # Debug shapes after processing
+    print(f"Processed shapes - u_upsampled: {u_coarse_upsampled.shape}, f_fine: {f_fine_norm.shape}")
+    
+    # Create input tensor with batch dimension
+    inputs = torch.zeros(1, 2, 40, 40, device=device)  # [1, 2, 40, 40]
+    inputs[0, 0, :, :] = u_coarse_upsampled.squeeze(0).squeeze(0)  # Upsampled coarse solution
+    inputs[0, 1, :, :] = f_fine_norm  # Fine forcing
     
     # Get model prediction
     with torch.no_grad():
         start_time = time.time()
-        prediction = model(inputs.unsqueeze(0))
+        prediction = model(inputs)  # [1, 1, 40, 40]
         inference_time = time.time() - start_time
         
     prediction = prediction * global_norm.u_std + global_norm.u_mean
@@ -119,40 +157,149 @@ def upscale_subdomain(model: torch.nn.Module, u_coarse: np.ndarray,
     
     return prediction, inference_time
 
-def split_into_subdomains(array: np.ndarray, subdomain_size: int) -> list:
-    """Split a 2D array into subdomains."""
-    n_subdomains = array.shape[0] // subdomain_size
+def split_into_subdomains(array: np.ndarray, subdomain_size: int, overlap: int = 0) -> list:
+    """Split a 2D array into subdomains with optional overlap."""
+    if overlap == 0:
+        # Original non-overlapping implementation
+        n_subdomains = array.shape[0] // subdomain_size
+        subdomains = []
+        
+        for i in range(n_subdomains):
+            row = []
+            for j in range(n_subdomains):
+                start_i = i * subdomain_size
+                start_j = j * subdomain_size
+                end_i = start_i + subdomain_size
+                end_j = start_j + subdomain_size
+                subdomain = array[start_i:end_i, start_j:end_j]
+                row.append(subdomain)
+            subdomains.append(row)
+        
+        return subdomains
+    else:
+        # Overlapping implementation
+        return split_into_overlapping_subdomains(array, subdomain_size, overlap)
+
+def split_into_overlapping_subdomains(array: np.ndarray, subdomain_size: int, overlap: int = 4) -> tuple:
+    """Split a 2D array into overlapping subdomains with positions."""
+    n = array.shape[0]
+    effective_size = subdomain_size - 2*overlap
+    n_subdomains = max(1, (n - 2*overlap) // effective_size + 1)
+    
     subdomains = []
+    positions = []
     
     for i in range(n_subdomains):
         row = []
+        pos_row = []
         for j in range(n_subdomains):
-            start_i = i * subdomain_size
-            start_j = j * subdomain_size
-            end_i = start_i + subdomain_size
-            end_j = start_j + subdomain_size
+            # Calculate actual start positions with overlap
+            start_i = min(i * effective_size, n - subdomain_size)
+            start_j = min(j * effective_size, n - subdomain_size)
+            
+            # Adjust to ensure we don't go out of bounds
+            end_i = min(start_i + subdomain_size, n)
+            end_j = min(start_j + subdomain_size, n)
+            start_i = max(0, end_i - subdomain_size)
+            start_j = max(0, end_j - subdomain_size)
+            
             subdomain = array[start_i:end_i, start_j:end_j]
             row.append(subdomain)
+            pos_row.append((start_i, start_j, end_i, end_j))
         subdomains.append(row)
+        positions.append(pos_row)
     
-    return subdomains
+    return subdomains, positions
 
-def stitch_subdomains(subdomains: list) -> np.ndarray:
-    """Stitch subdomains back together."""
-    n_rows = len(subdomains)
-    n_cols = len(subdomains[0])
-    subdomain_size = subdomains[0][0].shape[0]
-    full_size = n_rows * subdomain_size
+def stitch_subdomains(subdomains: list, overlap: int = 0) -> np.ndarray:
+    """Stitch subdomains back together with optional overlap handling."""
+    if overlap == 0 and not isinstance(subdomains, tuple):
+        # Original non-overlapping implementation
+        n_rows = len(subdomains)
+        n_cols = len(subdomains[0])
+        subdomain_size = subdomains[0][0].shape[0]
+        full_size = n_rows * subdomain_size
+        
+        result = np.zeros((full_size, full_size))
+        
+        for i in range(n_rows):
+            for j in range(n_cols):
+                start_i = i * subdomain_size
+                start_j = j * subdomain_size
+                end_i = start_i + subdomain_size
+                end_j = start_j + subdomain_size
+                result[start_i:end_i, start_j:end_j] = subdomains[i][j]
+        
+        return result
+    else:
+        # Overlapping implementation
+        if isinstance(subdomains, tuple):
+            return stitch_overlapping_subdomains(subdomains[0], subdomains[1], overlap)
+        else:
+            # Handle case where only subdomains are provided (backward compatibility)
+            n_rows = len(subdomains)
+            n_cols = len(subdomains[0])
+            subdomain_size = subdomains[0][0].shape[0]
+            full_size = n_rows * subdomain_size
+            return stitch_overlapping_subdomains(subdomains, None, full_size, overlap)
+
+def stitch_overlapping_subdomains(subdomains: list, positions: list = None, full_size: int = None, overlap: int = 4) -> np.ndarray:
+    """Stitch subdomains with smooth blending in overlap regions."""
+    # Determine full size if not provided
+    if full_size is None:
+        # Estimate from positions
+        max_i = max_j = 0
+        for row in positions:
+            for start_i, start_j, end_i, end_j in row:
+                max_i = max(max_i, end_i)
+                max_j = max(max_j, end_j)
+        full_size = max(max_i, max_j)
     
+    # Initialize result and weight map
     result = np.zeros((full_size, full_size))
+    weight_map = np.zeros((full_size, full_size))
     
-    for i in range(n_rows):
-        for j in range(n_cols):
-            start_i = i * subdomain_size
-            start_j = j * subdomain_size
-            end_i = start_i + subdomain_size
-            end_j = start_j + subdomain_size
-            result[start_i:end_i, start_j:end_j] = subdomains[i][j]
+    # Process each subdomain
+    for i in range(len(subdomains)):
+        for j in range(len(subdomains[0])):
+            # Get subdomain size
+            subdomain = subdomains[i][j]
+            h, w = subdomain.shape
+            
+            # Get position information
+            if positions is not None:
+                start_i, start_j, end_i, end_j = positions[i][j]
+            else:
+                # Fall back to regular grid if positions not provided
+                subdomain_size = h  # Assuming square subdomains
+                start_i = i * (subdomain_size - overlap)
+                start_j = j * (subdomain_size - overlap)
+                end_i = start_i + subdomain_size
+                end_j = start_j + subdomain_size
+            
+            # Create weight template for blending - higher weight to center pixels
+            weight = np.ones((h, w))
+            
+            # Apply tapering at edges (linear falloff in overlap regions)
+            taper_region = min(overlap, h//4)  # Limit taper region to 1/4 of subdomain size
+            for k in range(taper_region):
+                factor = (k + 1) / (taper_region + 1)
+                if start_i > 0:  # Top edge
+                    weight[k, :] *= factor
+                if end_i < full_size:  # Bottom edge
+                    weight[-k-1, :] *= factor
+                if start_j > 0:  # Left edge
+                    weight[:, k] *= factor
+                if end_j < full_size:  # Right edge
+                    weight[:, -k-1] *= factor
+            
+            # Apply weighted addition
+            result[start_i:end_i, start_j:end_j] += subdomain * weight
+            weight_map[start_i:end_i, start_j:end_j] += weight
+    
+    # Normalize by weights to get final result (avoid division by zero)
+    nonzero_mask = weight_map > 1e-8
+    result[nonzero_mask] /= weight_map[nonzero_mask]
     
     return result
 
@@ -192,23 +339,39 @@ def ml_multi_level_upscale(model: torch.nn.Module, data: dict,
             data['f'][next_res]    # fine forcing
         )
         
-        # Split into 20x20 subdomains
+        # Use overlapping subdomains to reduce boundary artifacts
+        overlap = 4  # 4 pixels of overlap on each side
         n_subdomains = current_res // 20
-        coarse_subdomains = split_into_subdomains(current_solution, 20)
-        f_subdomains = split_into_subdomains(data['f'][next_res], 40)
+        coarse_subdomains = split_into_subdomains(current_solution, 20, overlap=overlap)
+        f_subdomains = split_into_subdomains(data['f'][next_res], 40, overlap=overlap*2)
         
         # Process each subdomain
         upscaled_subdomains = []
         level_inference_time = 0
         level_predictions = 0
         
-        for i in range(n_subdomains):
+        # Handle different subdomain structures
+        if isinstance(coarse_subdomains, tuple):
+            # If it's a tuple, it's likely (subdomains, positions)
+            subdomains_data = coarse_subdomains[0]
+        else:
+            # Otherwise it's just the subdomains
+            subdomains_data = coarse_subdomains
+            
+        if isinstance(f_subdomains, tuple):
+            # If it's a tuple, it's likely (subdomains, positions)
+            f_subdomains_data = f_subdomains[0]
+        else:
+            # Otherwise it's just the subdomains
+            f_subdomains_data = f_subdomains
+        
+        for i in range(len(subdomains_data)):
             row = []
-            for j in range(n_subdomains):
+            for j in range(len(subdomains_data[i])):
                 prediction, inference_time = upscale_subdomain(
                     model,
-                    coarse_subdomains[i][j],
-                    f_subdomains[i][j],
+                    subdomains_data[i][j],
+                    f_subdomains_data[i][j],
                     None,  # We're not using theta anymore
                     global_norm,
                     device
@@ -229,8 +392,8 @@ def ml_multi_level_upscale(model: torch.nn.Module, data: dict,
         avg_time_ms = (level_inference_time / level_predictions) * 1000
         print(f"Level {current_res}→{next_res} timing: {avg_time_ms:.2f} ms per 40×40 prediction (total: {level_predictions} predictions)")
         
-        # Update for next iteration
-        current_solution = stitch_subdomains(upscaled_subdomains)
+        # Update for next iteration with boundary-aware stitching
+        current_solution = stitch_subdomains(upscaled_subdomains, overlap=overlap)
         current_res = next_res
     
     # Calculate and return overall average

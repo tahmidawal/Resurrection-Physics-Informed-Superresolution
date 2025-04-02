@@ -53,10 +53,10 @@ class UNet(nn.Module):
         self.dec2 = ConvBlock(256 + 128, 128)    # 20×20
         self.dec1 = ConvBlock(128 + 64, 64)      # 40×40
         
-        # Multi-scale output
-        self.out_conv1 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
+        # Multi-scale output with larger receptive field for better boundary handling
+        self.out_conv1 = nn.Conv2d(64, 32, kernel_size=5, padding=2)
         self.out_bn1 = nn.BatchNorm2d(32)
-        self.out_conv2 = nn.Conv2d(32, 16, kernel_size=3, padding=1)
+        self.out_conv2 = nn.Conv2d(32, 16, kernel_size=5, padding=2)
         self.out_bn2 = nn.BatchNorm2d(16)
         self.final = nn.Conv2d(16, 1, kernel_size=1)
         
