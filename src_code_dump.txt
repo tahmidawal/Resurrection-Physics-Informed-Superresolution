@@ -1,0 +1,1570 @@
+Filename 1: models.py
+Code 1:
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Tuple
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        """
+        Basic convolutional block with double convolution.
+        
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+        """
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        return x
+
+class UNet(nn.Module):
+    def __init__(self, in_channels: int = 2):
+        """
+        Enhanced U-Net architecture for PDE solution upscaling.
+        
+        Args:
+            in_channels: Number of input channels (coarse solution + f)
+        """
+        super().__init__()
+        
+        # Encoder (moderate depth)
+        self.enc1 = ConvBlock(in_channels, 64)    # 40×40
+        self.enc2 = ConvBlock(64, 128)           # 20×20
+        self.enc3 = ConvBlock(128, 256)          # 10×10
+        
+        # Bridge with dilated convolutions for larger receptive field
+        self.bridge = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, padding=2, dilation=2),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.Conv2d(512, 512, kernel_size=3, padding=2, dilation=2),
+            nn.BatchNorm2d(512),
+            nn.ReLU()
+        )
+        
+        # Decoder with skip connections
+        self.dec3 = ConvBlock(512 + 256, 256)    # 10×10
+        self.dec2 = ConvBlock(256 + 128, 128)    # 20×20
+        self.dec1 = ConvBlock(128 + 64, 64)      # 40×40
+        
+        # Multi-scale output
+        self.out_conv1 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
+        self.out_bn1 = nn.BatchNorm2d(32)
+        self.out_conv2 = nn.Conv2d(32, 16, kernel_size=3, padding=1)
+        self.out_bn2 = nn.BatchNorm2d(16)
+        self.final = nn.Conv2d(16, 1, kernel_size=1)
+        
+        # Attention gates
+        self.att3 = AttentionGate(256, 512)
+        self.att2 = AttentionGate(128, 256)
+        self.att1 = AttentionGate(64, 128)
+        
+        # Max pooling and upsampling
+        self.pool = nn.MaxPool2d(2)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Split input channels
+        coarse_solution = x[:, 0:1, :, :]
+        features = x[:, 1:, :, :]  # Now only contains f
+        
+        # Encoder
+        e1 = self.enc1(x)                    # 40×40
+        e2 = self.enc2(self.pool(e1))        # 20×20
+        e3 = self.enc3(self.pool(e2))        # 10×10
+        
+        # Bridge
+        b = self.bridge(e3)                  # 10×10
+        
+        # Decoder with attention and skip connections
+        e3_att = self.att3(e3, b)
+        d3 = self.dec3(torch.cat([b, e3_att], dim=1))
+        
+        e2_att = self.att2(e2, self.up(d3))
+        d2 = self.dec2(torch.cat([self.up(d3), e2_att], dim=1))
+        
+        e1_att = self.att1(e1, self.up(d2))
+        d1 = self.dec1(torch.cat([self.up(d2), e1_att], dim=1))
+        
+        # Multi-scale refinement
+        x = F.relu(self.out_bn1(self.out_conv1(d1)))
+        x = F.relu(self.out_bn2(self.out_conv2(x)))
+        x = self.final(x)
+        
+        # Residual connection from coarse solution
+        return x + coarse_solution
+
+class AttentionGate(nn.Module):
+    def __init__(self, in_channels: int, gating_channels: int, reduction: int = 8):
+        super().__init__()
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, in_channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // reduction, in_channels, 1),
+            nn.Sigmoid()
+        )
+        
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(gating_channels, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x: torch.Tensor, gating: torch.Tensor) -> torch.Tensor:
+        # Channel attention
+        ca = self.channel_attention(x)
+        x = x * ca
+        
+        # Spatial attention from gating signal
+        if gating.shape[-2:] != x.shape[-2:]:
+            gating = F.interpolate(gating, size=x.shape[-2:], mode='bilinear', align_corners=True)
+        sa = self.spatial_attention(gating)
+        x = x * sa
+        
+        return x
+
+class PDEDataset(torch.utils.data.Dataset):
+    def __init__(self, data_dict: dict, device: str = 'cuda'):
+        """
+        Dataset class for PDE solutions.
+        
+        Args:
+            data_dict: Dictionary containing the dataset
+            device: Device to store tensors on
+        """
+        self.device = device
+        
+        # Convert numpy arrays to tensors and move to device
+        self.u_coarse = torch.from_numpy(data_dict['u_coarse']).float().to(device)
+        self.u_fine = torch.from_numpy(data_dict['u_fine']).float().to(device)
+        self.f_fine = torch.from_numpy(data_dict['f_fine']).float().to(device)
+        
+        # Compute normalization statistics
+        self.u_mean = self.u_fine.mean()
+        self.u_std = self.u_fine.std()
+        self.f_mean = self.f_fine.mean()
+        self.f_std = self.f_fine.std()
+        
+        # Normalize the data
+        self.u_fine_norm = (self.u_fine - self.u_mean) / self.u_std
+        self.u_coarse_norm = (self.u_coarse - self.u_mean) / self.u_std
+        self.f_fine_norm = (self.f_fine - self.f_mean) / self.f_std
+        
+        # Upsample coarse solution to fine grid
+        self.u_coarse_upsampled = F.interpolate(
+            self.u_coarse_norm.unsqueeze(1),
+            size=(40, 40),
+            mode='bilinear',
+            align_corners=True
+        )
+        
+    def __len__(self) -> int:
+        return len(self.u_fine)
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Combine normalized inputs: [upsampled_coarse_solution, f]
+        x = torch.cat([
+            self.u_coarse_upsampled[idx],
+            self.f_fine_norm[idx].unsqueeze(0)
+        ], dim=0)
+        
+        # Target is the normalized fine solution
+        y = self.u_fine_norm[idx].unsqueeze(0)
+        
+        return x, y
+    
+    def denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Denormalize the model output back to original scale."""
+        return x * self.u_std + self.u_mean
+
+def init_weights(m: nn.Module):
+    """
+    Initialize network weights using Kaiming initialization.
+    
+    Args:
+        m: PyTorch module
+    """
+    if isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.constant_(m.weight, 1)
+        nn.init.constant_(m.bias, 0) 
+
+Filename 2: data_generation.py
+Code 2:
+import numpy as np
+from scipy.sparse import diags
+from scipy.sparse.linalg import spsolve
+import os
+from pathlib import Path
+from typing import Tuple, List
+import matplotlib.pyplot as plt
+import random
+
+class PoissonSolver:
+    def __init__(self, n_coarse: int = 20, n_fine: int = 40):
+        """
+        Initialize the Poisson equation solver.
+        
+        Args:
+            n_coarse: Number of grid points in each dimension for coarse grid
+            n_fine: Number of grid points in each dimension for fine grid
+        """
+        self.n_coarse = n_coarse
+        self.n_fine = n_fine
+        
+        # Initialize grids
+        self.x_coarse = np.linspace(0, 1, n_coarse)
+        self.y_coarse = np.linspace(0, 1, n_coarse)
+        self.x_fine = np.linspace(0, 1, n_fine)
+        self.y_fine = np.linspace(0, 1, n_fine)
+        
+        # Create meshgrids
+        self.X_coarse, self.Y_coarse = np.meshgrid(self.x_coarse, self.y_coarse)
+        self.X_fine, self.Y_fine = np.meshgrid(self.x_fine, self.y_fine)
+        
+        # Initialize Laplacian matrices
+        self.L_coarse = self._create_laplacian(n_coarse)
+        self.L_fine = self._create_laplacian(n_fine)
+
+    def _create_laplacian(self, n: int) -> np.ndarray:
+        """
+        Create the 2D Laplacian matrix using sparse matrices.
+        
+        Args:
+            n: Number of grid points in each dimension
+            
+        Returns:
+            Sparse matrix representing the 2D Laplacian operator
+        """
+        h = 1.0 / (n - 1)
+        n2 = n * n
+        
+        # Create 1D Laplacian
+        main_diag = -4 * np.ones(n2)
+        off_diag = np.ones(n2-1)
+        off_diag[np.arange(n-1, n2-1, n)] = 0  # Remove connections across boundary
+        
+        # Construct sparse matrix
+        diagonals = [main_diag, off_diag, off_diag, np.ones(n*(n-1)), np.ones(n*(n-1))]
+        offsets = [0, 1, -1, n, -n]
+        L = diags(diagonals, offsets, shape=(n2, n2))
+        
+        return L / (h * h)
+
+    def generate_forcing_term(self, k1: float, k2: float, grid: str = 'fine') -> np.ndarray:
+        """
+        Generate the forcing term f(x,y) = sin(k₁ * 2πx) * sin(k₂ * 2πy).
+        
+        Args:
+            k1: First wave number
+            k2: Second wave number
+            grid: 'fine' or 'coarse' grid
+            
+        Returns:
+            2D array containing the forcing term values
+        """
+        if grid == 'fine':
+            X, Y = self.X_fine, self.Y_fine
+        else:
+            X, Y = self.X_coarse, self.Y_coarse
+            
+        return np.sin(2 * np.pi * k1 * X) * np.sin(2 * np.pi * k2 * Y)
+
+    def solve_poisson(self, f: np.ndarray, theta: np.ndarray, grid: str = 'fine') -> np.ndarray:
+        """
+        Solve the Poisson equation -∇·(θ∇u) = f with zero Dirichlet boundary conditions.
+        
+        Args:
+            f: Forcing term
+            theta: Diffusion coefficient field
+            grid: 'fine' or 'coarse' grid
+            
+        Returns:
+            Solution u
+        """
+        n = self.n_fine if grid == 'fine' else self.n_coarse
+        L = self.L_fine if grid == 'fine' else self.L_coarse
+        
+        # Reshape inputs to 1D arrays
+        f_flat = f.reshape(-1)
+        theta_flat = theta.reshape(-1)
+        
+        # Modify Laplacian with theta
+        L_theta = diags(theta_flat) @ L
+        
+        # Solve the system
+        u_flat = spsolve(L_theta, f_flat)
+        
+        return u_flat.reshape((n, n))
+
+    def generate_dataset(self, n_samples: int, k_range: Tuple[float, float] = (1, 5)) -> dict:
+        """
+        Generate a dataset of PDE solutions.
+        
+        Args:
+            n_samples: Number of samples to generate
+            k_range: Range for random wave numbers
+            
+        Returns:
+            Dictionary containing the dataset
+        """
+        dataset = {
+            'u_coarse': [],
+            'u_fine': [],
+            'f_coarse': [],
+            'f_fine': [],
+            'theta_coarse': [],
+            'theta_fine': [],
+            'k1': [],
+            'k2': []
+        }
+        
+        for _ in range(n_samples):
+            # Generate random wave numbers
+            k1 = np.random.uniform(*k_range)
+            k2 = np.random.uniform(*k_range)
+            
+            # Generate random theta fields
+            theta_fine = np.random.uniform(0.5, 2.0, size=(self.n_fine, self.n_fine))
+            theta_coarse = theta_fine[::2, ::2]  # Downsample for coarse grid
+            
+            # Generate forcing terms
+            f_fine = self.generate_forcing_term(k1, k2, 'fine')
+            f_coarse = self.generate_forcing_term(k1, k2, 'coarse')
+            
+            # Solve PDE on both grids
+            u_fine = self.solve_poisson(f_fine, theta_fine, 'fine')
+            u_coarse = self.solve_poisson(f_coarse, theta_coarse, 'coarse')
+            
+            # Store results
+            dataset['u_coarse'].append(u_coarse)
+            dataset['u_fine'].append(u_fine)
+            dataset['f_coarse'].append(f_coarse)
+            dataset['f_fine'].append(f_fine)
+            dataset['theta_coarse'].append(theta_coarse)
+            dataset['theta_fine'].append(theta_fine)
+            dataset['k1'].append(k1)
+            dataset['k2'].append(k2)
+        
+        # Convert lists to arrays
+        for key in dataset:
+            dataset[key] = np.array(dataset[key])
+            
+        return dataset
+
+    def save_dataset(self, dataset: dict, path: str = 'data'):
+        """
+        Save the generated dataset.
+        
+        Args:
+            dataset: Dictionary containing the dataset
+            path: Path to save the dataset
+        """
+        save_path = Path(path)
+        if not save_path.exists():
+            save_path.mkdir(parents=True)
+            
+        np.savez(
+            save_path / 'pde_dataset.npz',
+            **dataset
+        )
+
+if __name__ == '__main__':
+    # Example usage
+    solver = PoissonSolver()
+    
+    # Generate a larger dataset
+    n_samples = 2000  # Increased from 100 to 1000
+    print(f"Generating {n_samples} samples...")
+    dataset = solver.generate_dataset(n_samples=n_samples, k_range=(0.5, 6.0))  # Wider k_range
+    
+    # Save the dataset
+    solver.save_dataset(dataset)
+    print("Dataset saved successfully!")
+    
+    # Create results directory if it doesn't exist
+    results_dir = Path('results')
+    if not results_dir.exists():
+        results_dir.mkdir(parents=True)
+    
+    # Plot an example solution
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(131)
+    plt.imshow(dataset['u_coarse'][0])
+    plt.colorbar()
+    plt.title('Coarse Solution')
+    
+    plt.subplot(132)
+    plt.imshow(dataset['u_fine'][0])
+    plt.colorbar()
+    plt.title('Fine Solution')
+    
+    plt.subplot(133)
+    plt.imshow(dataset['f_fine'][0])
+    plt.colorbar()
+    plt.title('Forcing Term (Fine)')
+    
+    plt.tight_layout()
+    plt.savefig(results_dir / 'example_solution.png')
+    plt.close()
+
+    # Create dataset_samples directory if it doesn't exist
+    samples_dir = Path('dataset_samples')
+    if not samples_dir.exists():
+        samples_dir.mkdir(parents=True)
+
+    # Plot 10 random samples
+    sample_indices = random.sample(range(n_samples), 10)
+    for i, idx in enumerate(sample_indices):
+        plt.figure(figsize=(15, 10))
+
+        plt.subplot(231)
+        plt.imshow(dataset['u_coarse'][idx])
+        plt.colorbar()
+        plt.title(f'Coarse Solution (Sample {idx})')
+
+        plt.subplot(232)
+        plt.imshow(dataset['u_fine'][idx])
+        plt.colorbar()
+        plt.title(f'Fine Solution (Sample {idx})')
+
+        plt.subplot(233)
+        plt.imshow(dataset['f_coarse'][idx])
+        plt.colorbar()
+        plt.title(f'Forcing Term Coarse (Sample {idx})')
+
+        plt.subplot(234)
+        plt.imshow(dataset['f_fine'][idx])
+        plt.colorbar()
+        plt.title(f'Forcing Term Fine (Sample {idx})')
+
+        plt.subplot(235)
+        plt.imshow(dataset['theta_coarse'][idx])
+        plt.colorbar()
+        plt.title(f'Theta Coarse (Sample {idx})')
+
+        plt.subplot(236)
+        plt.imshow(dataset['theta_fine'][idx])
+        plt.colorbar()
+        plt.title(f'Theta Fine (Sample {idx})')
+
+        plt.tight_layout()
+        plt.savefig(samples_dir / f'sample_{i}.png')
+        plt.close() 
+
+Filename 3: data_generation_subdomains.py
+Code 3:
+import numpy as np
+from scipy.sparse import diags
+from scipy.sparse.linalg import spsolve
+import os
+from pathlib import Path
+from typing import Tuple, List, Dict
+import matplotlib.pyplot as plt
+import random
+
+class PoissonSolver:
+    def __init__(self, n: int):
+        """
+        Initialize the Poisson equation solver.
+        
+        Args:
+            n: Number of grid points in each dimension
+        """
+        self.n = n
+        
+        # Initialize grid
+        self.x = np.linspace(0, 1, n)
+        self.y = np.linspace(0, 1, n)
+        
+        # Create meshgrid
+        self.X, self.Y = np.meshgrid(self.x, self.y)
+        
+        # Initialize Laplacian matrix
+        self.L = self._create_laplacian(n)
+
+    def _create_laplacian(self, n: int) -> np.ndarray:
+        """
+        Create the 2D Laplacian matrix using sparse matrices.
+        
+        Args:
+            n: Number of grid points in each dimension
+            
+        Returns:
+            Sparse matrix representing the 2D Laplacian operator
+        """
+        h = 1.0 / (n - 1)
+        n2 = n * n
+        
+        # Create 1D Laplacian
+        main_diag = -4 * np.ones(n2)
+        off_diag = np.ones(n2-1)
+        off_diag[np.arange(n-1, n2-1, n)] = 0  # Remove connections across boundary
+        
+        # Construct sparse matrix
+        diagonals = [main_diag, off_diag, off_diag, np.ones(n*(n-1)), np.ones(n*(n-1))]
+        offsets = [0, 1, -1, n, -n]
+        L = diags(diagonals, offsets, shape=(n2, n2))
+        
+        return L / (h * h)
+
+    def generate_forcing_term(self, k1: float, k2: float) -> np.ndarray:
+        """
+        Generate the forcing term f(x,y) = sin(k₁ * 2πx) * sin(k₂ * 2πy).
+        
+        Args:
+            k1: First wave number
+            k2: Second wave number
+            
+        Returns:
+            2D array containing the forcing term values
+        """
+        return np.sin(2 * np.pi * k1 * self.X) * np.sin(2 * np.pi * k2 * self.Y)
+
+    def solve_poisson(self, f: np.ndarray, theta: np.ndarray) -> np.ndarray:
+        """
+        Solve the Poisson equation -∇·(θ∇u) = f with zero Dirichlet boundary conditions.
+        
+        Args:
+            f: Forcing term
+            theta: Diffusion coefficient field
+            
+        Returns:
+            Solution u
+        """
+        # Reshape inputs to 1D arrays
+        f_flat = f.reshape(-1)
+        theta_flat = theta.reshape(-1)
+        
+        # Modify Laplacian with theta
+        L_theta = diags(theta_flat) @ self.L
+        
+        # Solve the system
+        u_flat = spsolve(L_theta, f_flat)
+        
+        return u_flat.reshape((self.n, self.n))
+
+def extract_subdomains(field: np.ndarray, grid_size: int, num_subdomains: int) -> List[np.ndarray]:
+    """
+    Extract subdomains from a field.
+    
+    Args:
+        field: The field to extract subdomains from
+        grid_size: The size of each subdomain (assuming square)
+        num_subdomains: Number of subdomains per dimension (total = num_subdomains^2)
+    
+    Returns:
+        List of subdomain arrays
+    """
+    total_size = field.shape[0]
+    step_size = total_size // num_subdomains
+    
+    subdomains = []
+    for i in range(num_subdomains):
+        for j in range(num_subdomains):
+            i_start = i * step_size
+            j_start = j * step_size
+            subdomain = field[i_start:i_start+grid_size, j_start:j_start+grid_size]
+            subdomains.append(subdomain)
+    
+    return subdomains
+
+def generate_dataset_part1(n_samples: int, k_range: Tuple[float, float] = (8.0, 10.0)) -> Dict:
+    """
+    Generate dataset with the first approach:
+    1. Generate u and f in 40x40 (coarse) and 80x80 (fine)
+    2. Take 4 subdomains of each grid (20x20 to 40x40)
+    
+    Args:
+        n_samples: Number of full grid samples to generate
+        k_range: Range for random wave numbers
+    
+    Returns:
+        Dictionary containing the dataset
+    """
+    # Initialize solvers
+    solver_coarse = PoissonSolver(40)  # 40x40 grid
+    solver_fine = PoissonSolver(80)    # 80x80 grid
+    
+    # Initialize dataset
+    dataset = {
+        'u_coarse': [],  # Will be 20x20
+        'u_fine': [],    # Will be 40x40
+        'f_coarse': [],  # Will be 20x20
+        'f_fine': [],    # Will be 40x40
+        'theta_coarse': [],  # Will be 20x20
+        'theta_fine': [],    # Will be 40x40
+        'k1': [],
+        'k2': []
+    }
+    
+    # Generate samples
+    for _ in range(n_samples):
+        # Generate random wave numbers
+        k1 = np.random.uniform(*k_range)
+        k2 = np.random.uniform(*k_range)
+        
+        # Set constant theta
+        theta_coarse = np.ones((40, 40))
+        theta_fine = np.ones((80, 80))
+        
+        # Generate forcing terms
+        f_coarse = solver_coarse.generate_forcing_term(k1, k2)
+        f_fine = solver_fine.generate_forcing_term(k1, k2)
+        
+        # Solve PDE
+        u_coarse = solver_coarse.solve_poisson(f_coarse, theta_coarse)
+        u_fine = solver_fine.solve_poisson(f_fine, theta_fine)
+        
+        # Extract 4 subdomains (2x2 grid of subdomains)
+        u_coarse_subdomains = extract_subdomains(u_coarse, 20, 2)  # 4 subdomains of 20x20
+        u_fine_subdomains = extract_subdomains(u_fine, 40, 2)      # 4 subdomains of 40x40
+        f_coarse_subdomains = extract_subdomains(f_coarse, 20, 2)  # 4 subdomains of 20x20
+        f_fine_subdomains = extract_subdomains(f_fine, 40, 2)      # 4 subdomains of 40x40
+        theta_coarse_subdomains = extract_subdomains(theta_coarse, 20, 2)  # 4 subdomains of 20x20
+        theta_fine_subdomains = extract_subdomains(theta_fine, 40, 2)     # 4 subdomains of 40x40
+        
+        # Store each subdomain as a separate sample
+        for i in range(4):
+            dataset['u_coarse'].append(u_coarse_subdomains[i])
+            dataset['u_fine'].append(u_fine_subdomains[i])
+            dataset['f_coarse'].append(f_coarse_subdomains[i])
+            dataset['f_fine'].append(f_fine_subdomains[i])
+            dataset['theta_coarse'].append(theta_coarse_subdomains[i])
+            dataset['theta_fine'].append(theta_fine_subdomains[i])
+            dataset['k1'].append(k1)
+            dataset['k2'].append(k2)
+    
+    # Convert lists to arrays
+    for key in dataset:
+        dataset[key] = np.array(dataset[key])
+        
+    return dataset
+
+def generate_dataset_part2(n_samples: int, k_range: Tuple[float, float] = (8.0, 10.0)) -> Dict:
+    """
+    Generate dataset with the second approach:
+    1. Generate u and f in 80x80 and 160x160
+    2. Take 16 subdomains of each grid (20x20 to 40x40)
+    
+    Args:
+        n_samples: Number of full grid samples to generate
+        k_range: Range for random wave numbers
+    
+    Returns:
+        Dictionary containing the dataset
+    """
+    # Initialize solvers
+    solver_coarse = PoissonSolver(80)   # 80x80 grid
+    solver_fine = PoissonSolver(160)    # 160x160 grid
+    
+    # Initialize dataset
+    dataset = {
+        'u_coarse': [],  # Will be 20x20
+        'u_fine': [],    # Will be 40x40
+        'f_coarse': [],  # Will be 20x20
+        'f_fine': [],    # Will be 40x40
+        'theta_coarse': [],  # Will be 20x20
+        'theta_fine': [],    # Will be 40x40
+        'k1': [],
+        'k2': []
+    }
+    
+    # Generate samples
+    for _ in range(n_samples):
+        # Generate random wave numbers
+        k1 = np.random.uniform(*k_range)
+        k2 = np.random.uniform(*k_range)
+        
+        # Set constant theta
+        theta_coarse = np.ones((80, 80))
+        theta_fine = np.ones((160, 160))
+        
+        # Generate forcing terms
+        f_coarse = solver_coarse.generate_forcing_term(k1, k2)
+        f_fine = solver_fine.generate_forcing_term(k1, k2)
+        
+        # Solve PDE
+        u_coarse = solver_coarse.solve_poisson(f_coarse, theta_coarse)
+        u_fine = solver_fine.solve_poisson(f_fine, theta_fine)
+        
+        # Extract 16 subdomains (4x4 grid of subdomains)
+        u_coarse_subdomains = extract_subdomains(u_coarse, 20, 4)  # 16 subdomains of 20x20
+        u_fine_subdomains = extract_subdomains(u_fine, 40, 4)      # 16 subdomains of 40x40
+        f_coarse_subdomains = extract_subdomains(f_coarse, 20, 4)  # 16 subdomains of 20x20
+        f_fine_subdomains = extract_subdomains(f_fine, 40, 4)      # 16 subdomains of 40x40
+        theta_coarse_subdomains = extract_subdomains(theta_coarse, 20, 4)  # 16 subdomains of 20x20
+        theta_fine_subdomains = extract_subdomains(theta_fine, 40, 4)     # 16 subdomains of 40x40
+        
+        # Store each subdomain as a separate sample
+        for i in range(16):
+            dataset['u_coarse'].append(u_coarse_subdomains[i])
+            dataset['u_fine'].append(u_fine_subdomains[i])
+            dataset['f_coarse'].append(f_coarse_subdomains[i])
+            dataset['f_fine'].append(f_fine_subdomains[i])
+            dataset['theta_coarse'].append(theta_coarse_subdomains[i])
+            dataset['theta_fine'].append(theta_fine_subdomains[i])
+            dataset['k1'].append(k1)
+            dataset['k2'].append(k2)
+    
+    # Convert lists to arrays
+    for key in dataset:
+        dataset[key] = np.array(dataset[key])
+        
+    return dataset
+
+def combine_datasets(dataset1: Dict, dataset2: Dict) -> Dict:
+    """
+    Combine two datasets.
+    
+    Args:
+        dataset1: First dataset
+        dataset2: Second dataset
+    
+    Returns:
+        Combined dataset
+    """
+    combined_dataset = {}
+    for key in dataset1.keys():
+        combined_dataset[key] = np.concatenate((dataset1[key], dataset2[key]), axis=0)
+    
+    return combined_dataset
+
+def save_dataset(dataset: Dict, path: str = 'data'):
+    """
+    Save the generated dataset.
+    
+    Args:
+        dataset: Dictionary containing the dataset
+        path: Path to save the dataset
+    """
+    save_path = Path(path)
+    if not save_path.exists():
+        save_path.mkdir(parents=True)
+        
+    np.savez(
+        save_path / 'pde_dataset_subdomains.npz',
+        **dataset
+    )
+
+def plot_samples(dataset: Dict, n_samples: int = 5, save_dir: str = 'dataset_samples'):
+    """
+    Plot a few samples from the dataset.
+    
+    Args:
+        dataset: Dictionary containing the dataset
+        n_samples: Number of samples to plot
+        save_dir: Directory to save the plots
+    """
+    # Create directory if it doesn't exist
+    save_path = Path(save_dir)
+    if not save_path.exists():
+        save_path.mkdir(parents=True)
+    
+    # Get random sample indices
+    sample_indices = random.sample(range(len(dataset['u_fine'])), n_samples)
+    
+    for i, idx in enumerate(sample_indices):
+        plt.figure(figsize=(15, 10))
+        
+        plt.subplot(231)
+        plt.imshow(dataset['u_coarse'][idx])
+        plt.colorbar()
+        plt.title(f'Coarse Solution (Sample {idx})')
+        
+        plt.subplot(232)
+        plt.imshow(dataset['u_fine'][idx])
+        plt.colorbar()
+        plt.title(f'Fine Solution (Sample {idx})')
+        
+        plt.subplot(233)
+        plt.imshow(dataset['f_coarse'][idx])
+        plt.colorbar()
+        plt.title(f'Forcing Term Coarse (Sample {idx})')
+        
+        plt.subplot(234)
+        plt.imshow(dataset['f_fine'][idx])
+        plt.colorbar()
+        plt.title(f'Forcing Term Fine (Sample {idx})')
+        
+        plt.subplot(235)
+        plt.imshow(dataset['theta_coarse'][idx])
+        plt.colorbar()
+        plt.title(f'Diffusion Coeff Coarse (Sample {idx})')
+        
+        plt.subplot(236)
+        plt.imshow(dataset['theta_fine'][idx])
+        plt.colorbar()
+        plt.title(f'Diffusion Coeff Fine (Sample {idx})')
+        
+        plt.tight_layout()
+        plt.savefig(save_path / f'subdomain_sample_{idx}.png')
+        plt.close()
+
+if __name__ == '__main__':
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    random.seed(42)
+    
+    # Part 1: Generate datasets from 40x40 and 80x80 grids
+    n_samples_part1 = 625  # 625 × 4 subdomains = 2500 samples
+    k_range = (8.0, 10.0)
+    
+    print(f"Part 1: Generating {n_samples_part1} samples (40x40 → 80x80) with k_range {k_range}...")
+    print(f"This will produce {n_samples_part1 * 4} subdomain samples (20x20 → 40x40)")
+    dataset_part1 = generate_dataset_part1(n_samples_part1, k_range)
+    
+    # Part 2: Generate datasets from 80x80 and 160x160 grids
+    n_samples_part2 = 219  # 219 × 16 subdomains ≈ 3500 samples (actually 3504)
+    
+    print(f"Part 2: Generating {n_samples_part2} samples (80x80 → 160x160) with k_range {k_range}...")
+    print(f"This will produce {n_samples_part2 * 16} subdomain samples (20x20 → 40x40)")
+    dataset_part2 = generate_dataset_part2(n_samples_part2, k_range)
+    
+    # Combine datasets
+    combined_dataset = combine_datasets(dataset_part1, dataset_part2)
+    print(f"Combined dataset contains {len(combined_dataset['u_fine'])} samples")
+    
+    # Verify shapes
+    print(f"Coarse solution shape: {combined_dataset['u_coarse'][0].shape}")
+    print(f"Fine solution shape: {combined_dataset['u_fine'][0].shape}")
+    
+    # Save dataset
+    save_dataset(combined_dataset)
+    print("Dataset saved successfully!")
+    
+    # Plot a few samples
+    plot_samples(combined_dataset, n_samples=10)
+    print("Sample plots saved successfully!") 
+
+Filename 4: compare_methods.py
+Code 4:
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+import torch
+import torch.nn.functional as F
+from models import UNet, PDEDataset
+from data_generation import PoissonSolver
+import seaborn as sns
+from datetime import datetime
+
+def load_model(checkpoint_path: Path, device: str = 'cuda') -> UNet:
+    """Load the trained model."""
+    model = UNet().to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    return model
+
+def plot_comparison(
+    coarse_solution: np.ndarray,
+    fine_solution: np.ndarray,
+    bilinear_upscaled: np.ndarray,
+    ml_upscaled: np.ndarray,
+    save_path: Path,
+    sample_idx: int,
+    k1: float,
+    k2: float,
+    theta_fine: np.ndarray
+):
+    """
+    Create a comprehensive comparison plot of different methods.
+    
+    Args:
+        coarse_solution: Original 20×20 solution
+        fine_solution: Ground truth 40×40 solution
+        bilinear_upscaled: Bilinearly interpolated solution
+        ml_upscaled: ML model's prediction
+        save_path: Path to save the plot
+        sample_idx: Index of the sample being plotted
+        k1, k2: Wave numbers used for this sample
+        theta_fine: Fine grid diffusion coefficient
+    """
+    fig = plt.figure(figsize=(20, 15))
+    plt.suptitle(f'Comparison of Upscaling Methods - Sample {sample_idx}
+' + 
+                f'k₁={k1:.2f}, k₂={k2:.2f}', fontsize=16)
+    
+    # Create grid for subplots
+    gs = plt.GridSpec(3, 4, figure=fig)
+    
+    # First row: Solutions
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(coarse_solution)
+    ax1.set_title('Coarse Solution (20×20)')
+    plt.colorbar(im1, ax=ax1)
+    
+    ax2 = fig.add_subplot(gs[0, 1])
+    im2 = ax2.imshow(fine_solution)
+    ax2.set_title('Ground Truth (40×40)')
+    plt.colorbar(im2, ax=ax2)
+    
+    ax3 = fig.add_subplot(gs[0, 2])
+    im3 = ax3.imshow(bilinear_upscaled)
+    ax3.set_title('Bilinear Interpolation')
+    plt.colorbar(im3, ax=ax3)
+    
+    ax4 = fig.add_subplot(gs[0, 3])
+    im4 = ax4.imshow(ml_upscaled)
+    ax4.set_title('ML Model Prediction')
+    plt.colorbar(im4, ax=ax4)
+    
+    # Second row: Absolute Errors
+    ax5 = fig.add_subplot(gs[1, 0])
+    im5 = ax5.imshow(theta_fine)
+    ax5.set_title('θ (Diffusion Coefficient)')
+    plt.colorbar(im5, ax=ax5)
+    
+    ax6 = fig.add_subplot(gs[1, 1])
+    im6 = ax6.imshow(np.zeros_like(fine_solution))
+    ax6.set_title('Ground Truth Error (Zero)')
+    plt.colorbar(im6, ax=ax6)
+    
+    bilinear_error = np.abs(bilinear_upscaled - fine_solution)
+    ax7 = fig.add_subplot(gs[1, 2])
+    im7 = ax7.imshow(bilinear_error)
+    ax7.set_title(f'Bilinear Error (MAE: {np.mean(bilinear_error):.4f})')
+    plt.colorbar(im7, ax=ax7)
+    
+    ml_error = np.abs(ml_upscaled - fine_solution)
+    ax8 = fig.add_subplot(gs[1, 3])
+    im8 = ax8.imshow(ml_error)
+    ax8.set_title(f'ML Model Error (MAE: {np.mean(ml_error):.4f})')
+    plt.colorbar(im8, ax=ax8)
+    
+    # Third row: Error histograms
+    ax9 = fig.add_subplot(gs[2, :2])
+    ax9.hist(bilinear_error.flatten(), bins=50, alpha=0.5, label='Bilinear')
+    ax9.hist(ml_error.flatten(), bins=50, alpha=0.5, label='ML Model')
+    ax9.set_title('Error Distribution')
+    ax9.set_xlabel('Absolute Error')
+    ax9.set_ylabel('Frequency')
+    ax9.legend()
+    
+    # Add error statistics
+    stats_text = (
+        f'Bilinear Interpolation:
+'
+        f'  MAE: {np.mean(bilinear_error):.6f}
+'
+        f'  Max Error: {np.max(bilinear_error):.6f}
+'
+        f'  RMSE: {np.sqrt(np.mean(bilinear_error**2)):.6f}
+
+'
+        f'ML Model:
+'
+        f'  MAE: {np.mean(ml_error):.6f}
+'
+        f'  Max Error: {np.max(ml_error):.6f}
+'
+        f'  RMSE: {np.sqrt(np.mean(ml_error**2)):.6f}'
+    )
+    ax10 = fig.add_subplot(gs[2, 2:])
+    ax10.text(0.1, 0.5, stats_text, fontfamily='monospace', fontsize=10)
+    ax10.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(save_path / f'comparison_sample_{sample_idx}.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def main():
+    # Configuration
+    config = {
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'num_samples': 5  # Number of samples to visualize
+    }
+    
+    # Create results directory
+    results_dir = Path('results')
+    runs = list(results_dir.glob('run_*'))
+    
+    if runs:
+        # Find the run with the trained model
+        for run_dir in sorted(runs, reverse=True):
+            model_path = run_dir / 'best_model.pth'
+            if model_path.exists():
+                break
+        else:
+            raise FileNotFoundError("No trained model found in any run directory")
+    else:
+        raise FileNotFoundError("No run directories found")
+    
+    comparison_dir = run_dir / 'method_comparison'
+    comparison_dir.mkdir(exist_ok=True)
+    
+    # Load trained model
+    model = load_model(model_path, device=config['device'])
+    
+    # Load dataset
+    data = np.load('data/pde_dataset.npz')
+    dataset = PDEDataset(data, device=config['device'])
+    
+    # Process multiple samples
+    for idx in range(config['num_samples']):
+        print(f'Processing sample {idx+1}/{config["num_samples"]}')
+        
+        # Get data for this sample
+        coarse_solution = data['u_coarse'][idx]
+        fine_solution = data['u_fine'][idx]
+        theta_fine = data['theta_fine'][idx]
+        k1 = data['k1'][idx]
+        k2 = data['k2'][idx]
+        
+        # Bilinear interpolation
+        bilinear_upscaled = F.interpolate(
+            torch.from_numpy(coarse_solution).float().unsqueeze(0).unsqueeze(0),
+            size=(40, 40),
+            mode='bilinear',
+            align_corners=True
+        ).squeeze().numpy()
+        
+        # ML model prediction
+        inputs, _ = dataset[idx]
+        with torch.no_grad():
+            ml_upscaled = model(inputs.unsqueeze(0))
+            # Denormalize the output
+            ml_upscaled = dataset.denormalize(ml_upscaled)
+            ml_upscaled = ml_upscaled.squeeze().cpu().numpy()
+        
+        # Create comparison plot
+        plot_comparison(
+            coarse_solution=coarse_solution,
+            fine_solution=fine_solution,
+            bilinear_upscaled=bilinear_upscaled,
+            ml_upscaled=ml_upscaled,
+            save_path=comparison_dir,
+            sample_idx=idx,
+            k1=k1,
+            k2=k2,
+            theta_fine=theta_fine
+        )
+        
+        # Print metrics
+        print(f'
+Metrics for sample {idx}:')
+        print(f'Bilinear MAE: {np.mean(np.abs(bilinear_upscaled - fine_solution)):.6f}')
+        print(f'ML Model MAE: {np.mean(np.abs(ml_upscaled - fine_solution)):.6f}')
+        
+        # Save numerical results
+        metrics = {
+            'bilinear_mae': float(np.mean(np.abs(bilinear_upscaled - fine_solution))),
+            'bilinear_rmse': float(np.sqrt(np.mean((bilinear_upscaled - fine_solution)**2))),
+            'bilinear_max_error': float(np.max(np.abs(bilinear_upscaled - fine_solution))),
+            'ml_model_mae': float(np.mean(np.abs(ml_upscaled - fine_solution))),
+            'ml_model_rmse': float(np.sqrt(np.mean((ml_upscaled - fine_solution)**2))),
+            'ml_model_max_error': float(np.max(np.abs(ml_upscaled - fine_solution))),
+            'k1': float(k1),
+            'k2': float(k2)
+        }
+        
+        with open(comparison_dir / f'metrics_sample_{idx}.txt', 'w') as f:
+            for name, value in metrics.items():
+                f.write(f'{name}: {value:.6f}
+')
+
+if __name__ == '__main__':
+    main() 
+
+Filename 5: resolution_comparison.py
+Code 5:
+import numpy as np
+import torch
+import torch.nn.functional as F
+from pathlib import Path
+from data_generation import PoissonSolver
+from models import UNet, PDEDataset
+from compare_methods import load_model
+import matplotlib.pyplot as plt
+import seaborn as sns
+import argparse
+from typing import Dict, List, Tuple
+import time
+
+def solve_multi_resolution(n_coarse: int = 40, resolutions: List[int] = [80, 160, 320, 640]):
+    """
+    Solve PDE at multiple resolutions, starting from n_coarse.
+    Returns solutions at all resolutions for comparison.
+    """
+    print("
+Generating multi-resolution test case...")
+    
+    # Create solvers for each resolution
+    solvers = {}
+    for n_fine in resolutions:
+        n_coarse_for_solver = n_fine // 2
+        solvers[n_fine] = PoissonSolver(n_coarse=n_coarse_for_solver, n_fine=n_fine)
+    
+    # Generate random k values (higher frequency for challenging test)
+    k1 = np.random.uniform(11.0, 12.0)
+    k2 = np.random.uniform(11.0, 12.0)
+    print(f"Using wave numbers: k₁={k1:.2f}, k₂={k2:.2f}")
+    
+    # Generate fields on finest grid (640x640)
+    n_finest = max(resolutions)
+    x = np.linspace(0, 1, n_finest)
+    y = np.linspace(0, 1, n_finest)
+    X, Y = np.meshgrid(x, y)
+    f_finest = np.sin(k1 * 2 * np.pi * X) * np.sin(k2 * 2 * np.pi * Y)
+    
+    # Use constant theta=1.0 instead of random values
+    theta_finest = np.ones((n_finest, n_finest))
+    
+    # Initialize data dictionary
+    data = {
+        'k1': k1,
+        'k2': k2,
+        'f': {},
+        'theta': {},
+        'u': {}
+    }
+    
+    # Downsample and solve for each resolution
+    print("
+Solving Poisson equation at all resolutions...")
+    for res in [n_coarse] + resolutions:
+        # Downsample f and theta
+        if res == n_finest:
+            data['f'][res] = f_finest
+            data['theta'][res] = theta_finest
+        else:
+            step = n_finest // res
+            data['f'][res] = f_finest[::step, ::step]
+            data['theta'][res] = theta_finest[::step, ::step]  # Still constant = 1.0
+        
+        # Solve PDE
+        if res == n_coarse:
+            solver = PoissonSolver(n_coarse=res//2, n_fine=res)
+            data['u'][res] = solver.solve_poisson(
+                data['f'][res], 
+                data['theta'][res], 
+                'fine'
+            )
+        else:
+            data['u'][res] = solvers[res].solve_poisson(
+                data['f'][res],
+                data['theta'][res],
+                'fine'
+            )
+        
+        print(f"
+Solution statistics for {res}x{res}:")
+        print(f"u_{res} - min: {data['u'][res].min():.6f}, max: {data['u'][res].max():.6f}")
+    
+    return data
+
+def upscale_subdomain(model: torch.nn.Module, u_coarse: np.ndarray, 
+                     f_fine: np.ndarray, theta_fine: np.ndarray,
+                     global_norm, device: str) -> np.ndarray:
+    """
+    Apply the ML model to upscale a single subdomain using global normalization.
+    """
+    # Convert inputs to tensors
+    u_coarse = torch.from_numpy(u_coarse).float().to(device)
+    f_fine = torch.from_numpy(f_fine).float().to(device)
+    
+    # Normalize using global statistics
+    u_coarse_norm = (u_coarse - global_norm.u_mean) / global_norm.u_std
+    f_fine_norm = (f_fine - global_norm.f_mean) / global_norm.f_std
+    
+    # Upsample coarse solution
+    u_coarse_upsampled = F.interpolate(
+        u_coarse_norm.unsqueeze(0).unsqueeze(0),
+        size=(40, 40),
+        mode='bilinear',
+        align_corners=True
+    )
+    
+    # Combine inputs (only coarse solution and f)
+    inputs = torch.cat([
+        u_coarse_upsampled.squeeze(0),
+        f_fine_norm.unsqueeze(0)
+    ], dim=0)
+    
+    # Get model prediction
+    with torch.no_grad():
+        start_time = time.time()
+        prediction = model(inputs.unsqueeze(0))
+        inference_time = time.time() - start_time
+        
+    prediction = prediction * global_norm.u_std + global_norm.u_mean
+    prediction = prediction.squeeze().cpu().numpy()
+    
+    return prediction, inference_time
+
+def split_into_subdomains(array: np.ndarray, subdomain_size: int) -> list:
+    """Split a 2D array into subdomains."""
+    n_subdomains = array.shape[0] // subdomain_size
+    subdomains = []
+    
+    for i in range(n_subdomains):
+        row = []
+        for j in range(n_subdomains):
+            start_i = i * subdomain_size
+            start_j = j * subdomain_size
+            end_i = start_i + subdomain_size
+            end_j = start_j + subdomain_size
+            subdomain = array[start_i:end_i, start_j:end_j]
+            row.append(subdomain)
+        subdomains.append(row)
+    
+    return subdomains
+
+def stitch_subdomains(subdomains: list) -> np.ndarray:
+    """Stitch subdomains back together."""
+    n_rows = len(subdomains)
+    n_cols = len(subdomains[0])
+    subdomain_size = subdomains[0][0].shape[0]
+    full_size = n_rows * subdomain_size
+    
+    result = np.zeros((full_size, full_size))
+    
+    for i in range(n_rows):
+        for j in range(n_cols):
+            start_i = i * subdomain_size
+            start_j = j * subdomain_size
+            end_i = start_i + subdomain_size
+            end_j = start_j + subdomain_size
+            result[start_i:end_i, start_j:end_j] = subdomains[i][j]
+    
+    return result
+
+class GlobalNormalization:
+    """Compute and store global normalization statistics."""
+    def __init__(self, u_fine, u_coarse, f_fine):
+        # Convert to tensors
+        u_fine = torch.from_numpy(u_fine).float()
+        u_coarse = torch.from_numpy(u_coarse).float()
+        f_fine = torch.from_numpy(f_fine).float()
+        
+        # Compute statistics
+        self.u_mean = u_fine.mean()
+        self.u_std = u_fine.std()
+        self.f_mean = f_fine.mean()
+        self.f_std = f_fine.std()
+
+def ml_multi_level_upscale(model: torch.nn.Module, data: dict, 
+                          target_resolution: int, device: str) -> tuple:
+    """
+    Perform multi-level upscaling using ML model from 40x40 to target resolution.
+    Returns the upscaled solution and timing information.
+    """
+    current_res = 40
+    current_solution = data['u'][current_res]
+    total_inference_time = 0
+    total_predictions = 0
+    
+    while current_res < target_resolution:
+        next_res = current_res * 2
+        print(f"
+Upscaling {current_res}x{current_res} → {next_res}x{next_res}")
+        
+        # Prepare normalization
+        global_norm = GlobalNormalization(
+            data['u'][next_res],  # fine solution (ground truth)
+            current_solution,      # coarse solution (current)
+            data['f'][next_res]    # fine forcing
+        )
+        
+        # Split into 20x20 subdomains
+        n_subdomains = current_res // 20
+        coarse_subdomains = split_into_subdomains(current_solution, 20)
+        f_subdomains = split_into_subdomains(data['f'][next_res], 40)
+        
+        # Process each subdomain
+        upscaled_subdomains = []
+        level_inference_time = 0
+        level_predictions = 0
+        
+        for i in range(n_subdomains):
+            row = []
+            for j in range(n_subdomains):
+                prediction, inference_time = upscale_subdomain(
+                    model,
+                    coarse_subdomains[i][j],
+                    f_subdomains[i][j],
+                    None,  # We're not using theta anymore
+                    global_norm,
+                    device
+                )
+                row.append(prediction)
+                
+                # Track timing
+                level_inference_time += inference_time
+                level_predictions += 1
+                
+            upscaled_subdomains.append(row)
+        
+        # Update timing stats
+        total_inference_time += level_inference_time
+        total_predictions += level_predictions
+        
+        # Print timing for this level
+        avg_time_ms = (level_inference_time / level_predictions) * 1000
+        print(f"Level {current_res}→{next_res} timing: {avg_time_ms:.2f} ms per 40×40 prediction (total: {level_predictions} predictions)")
+        
+        # Update for next iteration
+        current_solution = stitch_subdomains(upscaled_subdomains)
+        current_res = next_res
+    
+    # Calculate and return overall average
+    avg_time_ms = (total_inference_time / total_predictions) * 1000
+    print(f"
+Overall ML timing: {avg_time_ms:.2f} ms per 40×40 prediction (total: {total_predictions} predictions)")
+    
+    return current_solution, avg_time_ms
+
+def plot_resolution_comparison(data: dict, ml_solutions: dict, 
+                             bilinear_solutions: dict, save_dir: Path):
+    """
+    Create comparison plots for each resolution.
+    """
+    resolutions = sorted([res for res in ml_solutions.keys()])
+    
+    # Plot error metrics vs resolution
+    plt.figure(figsize=(12, 8))
+    plt.title('Error Metrics vs Resolution', fontsize=14)
+    
+    ml_maes = []
+    ml_rmses = []
+    bilinear_maes = []
+    bilinear_rmses = []
+    
+    for res in resolutions:
+        # ML metrics
+        ml_error = np.abs(ml_solutions[res] - data['u'][res])
+        ml_mae = np.mean(ml_error)
+        ml_rmse = np.sqrt(np.mean(ml_error**2))
+        ml_maes.append(ml_mae)
+        ml_rmses.append(ml_rmse)
+        
+        # Bilinear metrics
+        bl_error = np.abs(bilinear_solutions[res] - data['u'][res])
+        bl_mae = np.mean(bl_error)
+        bl_rmse = np.sqrt(np.mean(bl_error**2))
+        bilinear_maes.append(bl_mae)
+        bilinear_rmses.append(bl_rmse)
+    
+    # Plot metrics
+    plt.plot(resolutions, ml_maes, 'bo-', label='ML MAE', linewidth=2)
+    plt.plot(resolutions, ml_rmses, 'b^--', label='ML RMSE', linewidth=2)
+    plt.plot(resolutions, bilinear_maes, 'ro-', label='Bilinear MAE', linewidth=2)
+    plt.plot(resolutions, bilinear_rmses, 'r^--', label='Bilinear RMSE', linewidth=2)
+    
+    plt.xlabel('Resolution', fontsize=12)
+    plt.ylabel('Error', fontsize=12)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.yscale('log')
+    plt.xscale('log', base=2)
+    plt.xticks(resolutions, [f'{r}x{r}' for r in resolutions])
+    
+    # Add value labels
+    for i, res in enumerate(resolutions):
+        plt.text(res, ml_maes[i], f'{ml_maes[i]:.6f}', 
+                verticalalignment='bottom', horizontalalignment='right')
+        plt.text(res, bilinear_maes[i], f'{bilinear_maes[i]:.6f}',
+                verticalalignment='bottom', horizontalalignment='right')
+    
+    plt.tight_layout()
+    plt.savefig(save_dir / 'resolution_comparison_metrics.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Create detailed comparison plots for each resolution
+    for res in resolutions:
+        fig = plt.figure(figsize=(20, 20))
+        plt.suptitle(f'Solution Comparison at {res}x{res}', fontsize=16)
+        
+        # Use consistent normalization
+        vmin = min(data['u'][res].min(), ml_solutions[res].min(), bilinear_solutions[res].min())
+        vmax = max(data['u'][res].max(), ml_solutions[res].max(), bilinear_solutions[res].max())
+        
+        # Ground truth
+        ax1 = plt.subplot(331)
+        im1 = ax1.imshow(data['u'][res], vmin=vmin, vmax=vmax)
+        ax1.set_title(f'Ground Truth ({res}x{res})')
+        plt.colorbar(im1, ax=ax1)
+        
+        # ML solution
+        ax2 = plt.subplot(332)
+        im2 = ax2.imshow(ml_solutions[res], vmin=vmin, vmax=vmax)
+        ml_mae = np.mean(np.abs(ml_solutions[res] - data['u'][res]))
+        ax2.set_title(f'ML Multi-level
+MAE: {ml_mae:.6f}')
+        plt.colorbar(im2, ax=ax2)
+        
+        # Bilinear solution
+        ax3 = plt.subplot(333)
+        im3 = ax3.imshow(bilinear_solutions[res], vmin=vmin, vmax=vmax)
+        bl_mae = np.mean(np.abs(bilinear_solutions[res] - data['u'][res]))
+        ax3.set_title(f'Direct Bilinear
+MAE: {bl_mae:.6f}')
+        plt.colorbar(im3, ax=ax3)
+        
+        # Error plots
+        ax4 = plt.subplot(334)
+        error_ml = np.abs(ml_solutions[res] - data['u'][res])
+        im4 = ax4.imshow(error_ml)
+        ax4.set_title('ML Error')
+        plt.colorbar(im4, ax=ax4)
+        
+        ax5 = plt.subplot(335)
+        error_bl = np.abs(bilinear_solutions[res] - data['u'][res])
+        im5 = ax5.imshow(error_bl)
+        ax5.set_title('Bilinear Error')
+        plt.colorbar(im5, ax=ax5)
+        
+        # Error difference
+        ax6 = plt.subplot(336)
+        error_diff = error_ml - error_bl
+        im6 = ax6.imshow(error_diff, cmap='RdBu')
+        ax6.set_title('Error Difference
+(Blue: ML better)')
+        plt.colorbar(im6, ax=ax6)
+
+        # Theta plot
+        ax7 = plt.subplot(337)
+        im7 = ax7.imshow(data['theta'][res])
+        ax7.set_title(f'Theta ({res}x{res})')
+        plt.colorbar(im7, ax=ax7)
+
+        # Forcing term plot
+        ax8 = plt.subplot(338)
+        im8 = ax8.imshow(data['f'][res])
+        ax8.set_title(f'Forcing Term ({res}x{res})')
+        plt.colorbar(im8, ax=ax8)
+        
+        plt.tight_layout()
+        plt.savefig(save_dir / f'comparison_{res}x{res}.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Create error distribution plot
+        plt.figure(figsize=(12, 8))
+        plt.title(f'Error Distribution at {res}x{res}', fontsize=14)
+        
+        sns.kdeplot(data=error_ml.flatten(), 
+                   label=f'ML Multi-level (MAE: {ml_mae:.6f})',
+                   fill=True, alpha=0.5)
+        sns.kdeplot(data=error_bl.flatten(),
+                   label=f'Direct Bilinear (MAE: {bl_mae:.6f})',
+                   fill=True, alpha=0.5)
+        
+        plt.xlabel('Absolute Error', fontsize=12)
+        plt.ylabel('Density', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.3)
+        
+        # Add statistical information
+        ml_std = np.std(error_ml)
+        bl_std = np.std(error_bl)
+        plt.text(0.98, 0.95,
+                f'ML Std: {ml_std:.6f}
+Bilinear Std: {bl_std:.6f}',
+                transform=plt.gca().transAxes,
+                horizontalalignment='right',
+                verticalalignment='top',
+                bbox=dict(facecolor='white', alpha=0.8))
+        
+        plt.tight_layout()
+        plt.savefig(save_dir / f'error_distribution_{res}x{res}.png', 
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+
+def main():
+    parser = argparse.ArgumentParser(description='Multi-resolution upscaling comparison')
+    parser.add_argument('--model_path', type=str, required=True,
+                       help='Path to the model file')
+    args = parser.parse_args()
+    
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model not found at path: {model_path}")
+    
+    # Set device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    # Load model
+    model = load_model(model_path, device)
+    model.eval()
+    
+    # Create results directory
+    results_dir = model_path.parent / 'resolution_comparison_results'
+    results_dir.mkdir(exist_ok=True)
+    
+    # Define resolutions to test
+    resolutions = [80, 160, 320, 640]
+    
+    # Generate test data
+    data = solve_multi_resolution(n_coarse=40, resolutions=resolutions)
+    
+    # Initialize solution dictionaries
+    ml_solutions = {}
+    bilinear_solutions = {}
+    ml_timing_ms = {}
+    bilinear_timing_ms = {}
+    
+    # Perform upscaling for each target resolution
+    for res in resolutions:
+        print(f"
+=== Testing upscaling to {res}x{res} ===")
+        
+        # ML multi-level upscaling
+        print("
+Performing ML multi-level upscaling...")
+        ml_solutions[res], ml_timing_ms[res] = ml_multi_level_upscale(
+            model, data, res, device
+        )
+        
+        # Direct bilinear upscaling
+        print("
+Performing direct bilinear upscaling...")
+        start_time = time.time()
+        bilinear_solutions[res] = F.interpolate(
+            torch.from_numpy(data['u'][40]).float().unsqueeze(0).unsqueeze(0),
+            size=(res, res),
+            mode='bilinear',
+            align_corners=True
+        ).squeeze().numpy()
+        bilinear_time = time.time() - start_time
+        bilinear_timing_ms[res] = bilinear_time * 1000
+        print(f"Bilinear timing: {bilinear_timing_ms[res]:.2f} ms for full {res}×{res} upscaling")
+        
+        # Calculate metrics
+        ml_mae = np.mean(np.abs(ml_solutions[res] - data['u'][res]))
+        ml_rmse = np.sqrt(np.mean((ml_solutions[res] - data['u'][res])**2))
+        
+        bl_mae = np.mean(np.abs(bilinear_solutions[res] - data['u'][res]))
+        bl_rmse = np.sqrt(np.mean((bilinear_solutions[res] - data['u'][res])**2))
+        
+        print(f"
+Results for {res}x{res}:")
+        print(f"ML Multi-level - MAE: {ml_mae:.6f}, RMSE: {ml_rmse:.6f}, Avg Time: {ml_timing_ms[res]:.2f} ms per 40×40 patch")
+        print(f"Direct Bilinear - MAE: {bl_mae:.6f}, RMSE: {bl_rmse:.6f}, Time: {bilinear_timing_ms[res]:.2f} ms total")
+    
+    # Print timing summary
+    print("
+===== ML Inference Timing Summary =====")
+    print("Resolution | Avg Time per 40×40 patch (ms)")
+    print("----------------------------------------")
+    for res in resolutions:
+        print(f"{res}×{res} | {ml_timing_ms[res]:.2f} ms")
+    
+    # Create comparison plots
+    plot_resolution_comparison(data, ml_solutions, bilinear_solutions, results_dir)
+
+if __name__ == '__main__':
+    main() 

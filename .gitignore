@@ -1,49 +1,8 @@
-# Python cache files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution / packaging
-*.so
-*.egg-info/
-*.egg
-
-# Jupyter Notebook
-.ipynb_checkpoints
-*.ipynb
-
-# Model checkpoints and binary files
 *.pth
-*.pt
-*.h5
-*.hdf5
-*.pkl
 *.npz
-
-# Images
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.bmp
-*.svg
-*.pdf
-
-# Logs and databases
-*.log
-*.sqlite
-events.out.tfevents.*
-
-# OS-specific files
+__pycache__/
+*.pyc
+venv/
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Directories to ignore
-results/*/tensorboard/
-dataset_samples/
-data/ 
+*.out
+*.log

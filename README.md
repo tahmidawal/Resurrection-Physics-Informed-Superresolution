@@ -1,36 +1,104 @@
-# Resurrection Physics Informed Super-resolution
+# PDE Solution Refinement with Context-Aware UNet
 
-This project aims to enhance image resolution using physics-informed super-resolution techniques. The repository contains various scripts and results related to the project.
+This repository contains code for training and testing a Context-Aware UNet model for refining coarse PDE solutions to finer resolutions while maintaining accuracy at overlapping boundaries.
 
-## Project Structure
+## Setup
 
-### Source Code (`src/`)
+1. Create a virtual environment and activate it:
+```bash
+python -m venv venv
+source venv/bin/activate
+```
 
-- **`compare_methods.py`**: Contains methods to compare different super-resolution techniques.
-- **`data_generation.py`**: Responsible for generating synthetic data for training and testing.
-- **`large_scale_320 copy.py`**: A script for handling large-scale data processing.
-- **`models.py`**: Defines the machine learning models used for super-resolution.
-- **`resolution_comparison.py`**: Compares the resolution of images before and after applying super-resolution.
-- **`resolution_comparison_enhanced copy.py`**: An enhanced version of the resolution comparison script.
-- **`test_out_of_sample.py`**: Tests the model's performance on out-of-sample data.
-- **`train.py`**: Script to train the super-resolution models.
-- **`utils.py`**: Utility functions used across different scripts.
-- **`visualization.py`**: Contains functions for visualizing results.
+2. Install required packages:
+```bash
+pip install torch numpy matplotlib
+```
 
-### Results (`results/`)
+## Data Generation
 
-- **`run_20250303_173409/`**: Contains the results of a specific run.
-  - **`config.json`**: Configuration file for the run.
-  - **`best_model.pth`**: The best-performing model saved during the run.
-  - **`resolution_comparison_results/`**: Contains images and metrics comparing resolutions.
-    - **`comparison_80x80.png`**, **`comparison_160x160.png`**, **`comparison_320x320.png`**, **`comparison_640x640.png`**: Images showing resolution comparisons at different scales.
-    - **`error_distribution_80x80.png`**, **`error_distribution_160x160.png`**, **`error_distribution_320x320.png`**, **`error_distribution_640x640.png`**: Images showing error distributions at different scales.
-    - **`resolution_comparison_metrics.png`**: Metrics related to resolution comparison.
+The dataset consists of PDE solutions at different resolutions with overlapping boundaries. To generate the dataset:
 
-## Getting Started
+1. Run the data generation script:
+```bash
+python src/generate_data.py --num_samples 1000 --output_path data/pde_dataset_overlapping.npz
+```
 
-To get started with the project, clone the repository and follow the instructions in the `train.py` script to train the models.
+This will create a dataset with:
+- Coarse solutions (24x24)
+- Fine solutions (48x48)
+- Forcing functions at both resolutions
+- Material parameters k₁ and k₂
 
-## License
+## Training
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. 
+To train the model:
+
+```bash
+python src/train.py --epochs 100 --batch_size 32 --learning_rate 0.001
+```
+
+The training script will:
+- Save checkpoints in `results/run_improved_[timestamp]/`
+- Track metrics using tensorboard
+- Save the best model based on validation loss
+
+## Testing
+
+For inference testing:
+
+```bash
+python src/test_inference.py --num_samples 10 --output_dir Output/inference_results
+```
+
+### Latest Test Results
+
+Average metrics across 10 test samples:
+- Bilinear MAE: 0.000075
+- ML Model MAE: 0.000013
+- Average Improvement: 5.73x
+
+Individual sample improvements ranged from 4.94x to 11.44x, demonstrating consistent performance across different test cases.
+
+Sample-specific results:
+```
+Sample 1: 9.34x improvement (MAE: 0.000005)
+Sample 2: 5.50x improvement (MAE: 0.000017)
+Sample 3: 11.44x improvement (MAE: 0.000005)
+Sample 4: 5.50x improvement (MAE: 0.000009)
+```
+
+The model consistently outperforms bilinear interpolation, with particularly strong performance on samples with complex features or sharp gradients.
+
+## Quick Testing
+
+For a quick test on a single sample:
+
+```bash
+python src/quick_test.py
+```
+
+This will generate visualizations comparing:
+- Input coarse solution
+- Ground truth fine solution
+- Model prediction
+- Bilinear upsampling baseline
+- Error distributions
+
+## Model Architecture
+
+The Context-Aware UNet architecture features:
+- Input channels: 2 (solution + forcing function)
+- Context padding: 2 cells
+- Overlapping boundary handling
+- Skip connections for feature preservation
+
+## Batch Job Support
+
+For HPC environments, use the provided SLURM script:
+
+```bash
+sbatch src/run_inference_test.sbatch
+```
+
+This will run the inference test on a GPU node and save results in the Output directory. 

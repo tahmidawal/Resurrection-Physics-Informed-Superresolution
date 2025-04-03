@@ -1,0 +1,56 @@
+Average metrics across all test samples:
+Bilinear MAE: 0.000075
+ML Model MAE: 0.000013
+Improvement: 5.73x
+
+Per-sample metrics:
+Sample 0:
+  Bilinear MAE: 0.000075
+  ML Model MAE: 0.000015
+  Improvement: 4.94x
+
+Sample 1:
+  Bilinear MAE: 0.000050
+  ML Model MAE: 0.000005
+  Improvement: 9.34x
+
+Sample 2:
+  Bilinear MAE: 0.000092
+  ML Model MAE: 0.000017
+  Improvement: 5.50x
+
+Sample 3:
+  Bilinear MAE: 0.000053
+  ML Model MAE: 0.000005
+  Improvement: 11.44x
+
+Sample 4:
+  Bilinear MAE: 0.000049
+  ML Model MAE: 0.000009
+  Improvement: 5.50x
+
+Sample 5:
+  Bilinear MAE: 0.000085
+  ML Model MAE: 0.000016
+  Improvement: 5.38x
+
+Sample 6:
+  Bilinear MAE: 0.000089
+  ML Model MAE: 0.000016
+  Improvement: 5.57x
+
+Sample 7:
+  Bilinear MAE: 0.000092
+  ML Model MAE: 0.000017
+  Improvement: 5.53x
+
+Sample 8:
+  Bilinear MAE: 0.000081
+  ML Model MAE: 0.000015
+  Improvement: 5.27x
+
+Sample 9:
+  Bilinear MAE: 0.000086
+  ML Model MAE: 0.000017
+  Improvement: 5.17x
+
