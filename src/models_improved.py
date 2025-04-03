@@ -27,6 +27,7 @@ class ContextAwareUNet(nn.Module):
     def __init__(self, in_channels: int = 2, context_padding: int = 2):
         """
         Enhanced U-Net architecture for PDE solution upscaling with context awareness.
+        Specifically optimized for 24x24 -> 48x48 upscaling.
         
         Args:
             in_channels: Number of input channels (coarse solution + f)
@@ -116,16 +117,16 @@ class ContextAwareUNet(nn.Module):
             # Calculate dimensions for the core region
             h, w = x.shape[2], x.shape[3]
             
-            # Ensure the output size is exactly 40x40 (matching dataset target)
-            core_h = 40
-            core_w = 40
+            # Ensure the output size is exactly 48x48 for the 24x24 -> 48x48 upscaling
+            core_h = 48
+            core_w = 48
             
-            # Calculate appropriate padding to extract
-            pad_h = (h - core_h) // 2
-            pad_w = (w - core_w) // 2
-            
-            # Extract core region
-            x = x[:, :, pad_h:pad_h+core_h, pad_w:pad_w+core_w]
+            # Calculate appropriate padding to extract if the tensor is larger
+            # This handles the case with context padding
+            if h > core_h:
+                pad_h = (h - core_h) // 2
+                pad_w = (w - core_w) // 2
+                x = x[:, :, pad_h:pad_h+core_h, pad_w:pad_w+core_w]
         
         return x
 
@@ -218,6 +219,7 @@ class OverlappingPDEDataset(torch.utils.data.Dataset):
     def __init__(self, data_dict: dict, device: str = 'cuda', core_size: Tuple[int, int] = (20, 40), context_size: Tuple[int, int] = (24, 48)):
         """
         Dataset class for PDE solutions with overlapping context windows.
+        Optimized for 24x24 -> 48x48 upscaling.
         
         Args:
             data_dict: Dictionary containing the dataset
@@ -249,10 +251,10 @@ class OverlappingPDEDataset(torch.utils.data.Dataset):
         self.u_coarse_norm = (self.u_coarse - self.u_mean) / self.u_std
         self.f_fine_norm = (self.f_fine - self.f_mean) / self.f_std
         
-        # Upsample coarse solution to fine grid
+        # Upsample coarse solution to fine grid (24x24 -> 48x48)
         self.u_coarse_upsampled = F.interpolate(
             self.u_coarse_norm.unsqueeze(1),
-            size=(self.context_size[1], self.context_size[1]),  # Upsample to fine context size (48x48)
+            size=(48, 48),  # Upscale to 48x48
             mode='bilinear',
             align_corners=True
         )
@@ -267,17 +269,8 @@ class OverlappingPDEDataset(torch.utils.data.Dataset):
             self.f_fine_norm[idx].unsqueeze(0)
         ], dim=0)
         
-        # Target is the normalized fine solution (only the core region)
-        # Extract core region
-        fine_h, fine_w = self.u_fine_norm[idx].shape
-        core_h, core_w = self.core_size[1], self.core_size[1]  # Both are 40
-        
-        # Calculate start indices
-        start_h = (fine_h - core_h) // 2
-        start_w = (fine_w - core_w) // 2
-        
-        core_fine = self.u_fine_norm[idx][start_h:start_h+core_h, start_w:start_w+core_w]
-        y = core_fine.unsqueeze(0)
+        # For 24x24 -> 48x48 upscaling, we use the full fine solution
+        y = self.u_fine_norm[idx].unsqueeze(0)
         
         return x, y
     
@@ -345,4 +338,52 @@ def init_weights(m: nn.Module):
             nn.init.constant_(m.bias, 0)
     elif isinstance(m, nn.BatchNorm2d):
         nn.init.constant_(m.weight, 1)
-        nn.init.constant_(m.bias, 0) 
+        nn.init.constant_(m.bias, 0)
+
+class BoundaryAwareLoss(nn.Module):
+    def __init__(self, lambda_boundary: float = 2.0):
+        """
+        Loss function that gives higher weight to boundaries/edges.
+        
+        Args:
+            lambda_boundary: Weight multiplier for boundary regions
+        """
+        super().__init__()
+        self.lambda_boundary = lambda_boundary
+        self.mse = nn.MSELoss()
+        
+        # Define Sobel filters for edge detection
+        self.sobel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+        
+        self.sobel_y = torch.tensor([
+            [-1, -2, -1],
+            [0, 0, 0],
+            [1, 2, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+    
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Move Sobel filters to the same device as input tensors
+        device = prediction.device
+        sobel_x = self.sobel_x.to(device)
+        sobel_y = self.sobel_y.to(device)
+        
+        # Calculate gradients (edges) in target image
+        # Pad to maintain input size
+        padded_target = F.pad(target, (1, 1, 1, 1), mode='reflect')
+        grad_x = F.conv2d(padded_target, sobel_x)
+        grad_y = F.conv2d(padded_target, sobel_y)
+        target_grad_magnitude = torch.sqrt(grad_x**2 + grad_y**2)
+        
+        # Create a weight map that emphasizes edges
+        edge_weights = 1.0 + self.lambda_boundary * (target_grad_magnitude / (target_grad_magnitude.max() + 1e-8))
+        
+        # Compute weighted MSE loss
+        squared_diff = (prediction - target)**2
+        weighted_squared_diff = squared_diff * edge_weights
+        
+        # Return mean loss
+        return weighted_squared_diff.mean() 
