@@ -1,0 +1,31 @@
+Average metrics across all test samples:
+Bilinear MAE: 0.000064
+ML Model MAE: 0.000010
+Improvement: 6.23x
+
+Per-sample metrics:
+Sample 0:
+  Bilinear MAE: 0.000075
+  ML Model MAE: 0.000015
+  Improvement: 5.01x
+
+Sample 1:
+  Bilinear MAE: 0.000050
+  ML Model MAE: 0.000006
+  Improvement: 8.97x
+
+Sample 2:
+  Bilinear MAE: 0.000092
+  ML Model MAE: 0.000017
+  Improvement: 5.33x
+
+Sample 3:
+  Bilinear MAE: 0.000053
+  ML Model MAE: 0.000005
+  Improvement: 11.26x
+
+Sample 4:
+  Bilinear MAE: 0.000049
+  ML Model MAE: 0.000009
+  Improvement: 5.61x
+
