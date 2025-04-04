@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Tuple, List, Dict
 import matplotlib.pyplot as plt
 import random
+import argparse
+import gc  # Garbage collector
 
 class PoissonSolver:
     def __init__(self, n: int):
@@ -294,22 +296,126 @@ def combine_datasets(dataset1: Dict, dataset2: Dict) -> Dict:
     
     return combined_dataset
 
-def save_dataset(dataset: Dict, path: str = 'data'):
+def save_dataset_in_batches(dataset: Dict, path: str = 'data', batch_size: int = 1000):
     """
-    Save the generated dataset.
+    Save the generated dataset in batches to avoid memory issues.
     
     Args:
         dataset: Dictionary containing the dataset
         path: Path to save the dataset
+        batch_size: Number of samples to save in each batch
     """
     save_path = Path(path)
     if not save_path.exists():
         save_path.mkdir(parents=True)
+    
+    total_samples = len(dataset['u_fine'])
+    
+    # Save in batches
+    if total_samples > batch_size:
+        print(f"Dataset is large ({total_samples} samples). Saving in batches of {batch_size}...")
         
-    np.savez(
-        save_path / 'pde_dataset_overlapping.npz',
-        **dataset
-    )
+        # First save metadata and create file
+        init_data = {
+            'total_samples': total_samples,
+            'k1': dataset['k1'],
+            'k2': dataset['k2']
+        }
+        np.savez(save_path / 'pde_dataset_overlapping.npz', **init_data)
+        
+        # Then save each batch
+        for start_idx in range(0, total_samples, batch_size):
+            end_idx = min(start_idx + batch_size, total_samples)
+            print(f"Saving batch {start_idx//batch_size + 1}: samples {start_idx} to {end_idx-1}")
+            
+            batch_data = {}
+            for key in ['u_coarse', 'u_fine', 'f_coarse', 'f_fine', 'theta_coarse', 'theta_fine']:
+                batch_data[f'{key}_batch_{start_idx//batch_size}'] = dataset[key][start_idx:end_idx]
+            
+            # Append to the npz file
+            with np.load(save_path / 'pde_dataset_overlapping.npz') as data:
+                # Convert loaded npz to dict
+                existing_data = {key: data[key] for key in data.files}
+                
+                # Combine with new batch data
+                combined_data = {**existing_data, **batch_data}
+                
+                # Save combined data
+                np.savez(save_path / 'pde_dataset_overlapping.npz', **combined_data)
+            
+            # Clear memory
+            del batch_data
+            gc.collect()
+    else:
+        # Save as single file if small enough
+        np.savez(save_path / 'pde_dataset_overlapping.npz', **dataset)
+    
+    print(f"Dataset saved to {save_path / 'pde_dataset_overlapping.npz'}")
+
+def generate_dataset_in_batches(n_samples_part1: int, n_samples_part2: int, k_range: Tuple[float, float], batch_size: int = 500):
+    """
+    Generate the dataset in batches to save memory.
+    
+    Args:
+        n_samples_part1: Number of samples for part 1
+        n_samples_part2: Number of samples for part 2
+        k_range: Range of wave numbers
+        batch_size: Number of samples to generate in each batch
+    """
+    # Initialize dataset
+    dataset = {
+        'u_coarse': [],
+        'u_fine': [],
+        'f_coarse': [],
+        'f_fine': [],
+        'theta_coarse': [],
+        'theta_fine': [],
+        'k1': [],
+        'k2': []
+    }
+    
+    # Part 1: Generate datasets from 48x48 and 96x96 grids in batches
+    print(f"Part 1: Generating {n_samples_part1} samples (48x48 → 96x96) with k_range {k_range}...")
+    for start_idx in range(0, n_samples_part1, batch_size):
+        end_idx = min(start_idx + batch_size, n_samples_part1)
+        print(f"  Generating batch {start_idx//batch_size + 1}: samples {start_idx} to {end_idx-1}")
+        
+        # Generate this batch
+        batch_samples = end_idx - start_idx
+        batch_data = generate_dataset_part1(batch_samples, k_range)
+        
+        # Add to overall dataset
+        for key in dataset:
+            dataset[key].extend(batch_data[key])
+        
+        # Clear memory
+        del batch_data
+        gc.collect()
+    
+    # Part 2: Generate datasets from 96x96 and 192x192 grids in batches
+    print(f"Part 2: Generating {n_samples_part2} samples (96x96 → 192x192) with k_range {k_range}...")
+    for start_idx in range(0, n_samples_part2, batch_size // 4):  # Smaller batches for larger grids
+        end_idx = min(start_idx + batch_size // 4, n_samples_part2)
+        print(f"  Generating batch {start_idx//(batch_size//4) + 1}: samples {start_idx} to {end_idx-1}")
+        
+        # Generate this batch
+        batch_samples = end_idx - start_idx
+        batch_data = generate_dataset_part2(batch_samples, k_range)
+        
+        # Add to overall dataset
+        for key in dataset:
+            dataset[key].extend(batch_data[key])
+        
+        # Clear memory
+        del batch_data
+        gc.collect()
+    
+    # Convert lists to arrays
+    for key in dataset:
+        dataset[key] = np.array(dataset[key])
+    
+    print(f"Combined dataset contains {len(dataset['u_fine'])} samples")
+    return dataset
 
 def plot_samples(dataset: Dict, n_samples: int = 5, save_dir: str = 'dataset_samples_overlapping'):
     """
@@ -366,37 +472,51 @@ def plot_samples(dataset: Dict, n_samples: int = 5, save_dir: str = 'dataset_sam
         plt.close()
 
 if __name__ == '__main__':
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Generate dataset of PDE solutions with overlapping subdomains')
+    parser.add_argument('--samples_part1', type=int, default=625, 
+                        help='Number of samples for part 1 (48x48 to 96x96 grids)')
+    parser.add_argument('--samples_part2', type=int, default=219, 
+                        help='Number of samples for part 2 (96x96 to 192x192 grids)')
+    parser.add_argument('--k_range_min', type=float, default=8.0,
+                        help='Minimum value for wave number range')
+    parser.add_argument('--k_range_max', type=float, default=10.0,
+                        help='Maximum value for wave number range')
+    parser.add_argument('--batch_size', type=int, default=500,
+                        help='Batch size for generating and saving data')
+    args = parser.parse_args()
+    
     # Set random seed for reproducibility
     np.random.seed(42)
     random.seed(42)
     
-    # Part 1: Generate datasets from 48x48 and 96x96 grids
-    n_samples_part1 = 625  # 625 × 4 subdomains = 2500 samples
-    k_range = (8.0, 10.0)
+    # Get arguments
+    n_samples_part1 = args.samples_part1
+    n_samples_part2 = args.samples_part2
+    k_range = (args.k_range_min, args.k_range_max)
+    batch_size = args.batch_size
     
-    print(f"Part 1: Generating {n_samples_part1} samples (48x48 → 96x96) with k_range {k_range}...")
-    print(f"This will produce {n_samples_part1 * 4} subdomain samples (24x24 → 48x48)")
-    dataset_part1 = generate_dataset_part1(n_samples_part1, k_range)
+    print(f"Generating dataset with:")
+    print(f"  - Part 1: {n_samples_part1} samples x 4 subdomains = {n_samples_part1 * 4} subdomain samples")
+    print(f"  - Part 2: {n_samples_part2} samples x 16 subdomains = {n_samples_part2 * 16} subdomain samples")
+    print(f"  - Total: ~{n_samples_part1 * 4 + n_samples_part2 * 16} subdomain samples")
+    print(f"  - k-range: {k_range}")
+    print(f"  - Batch size: {batch_size}")
     
-    # Part 2: Generate datasets from 96x96 and 192x192 grids
-    n_samples_part2 = 219  # 219 × 16 subdomains ≈ 3500 samples (actually 3504)
-    
-    print(f"Part 2: Generating {n_samples_part2} samples (96x96 → 192x192) with k_range {k_range}...")
-    print(f"This will produce {n_samples_part2 * 16} subdomain samples (24x24 → 48x48)")
-    dataset_part2 = generate_dataset_part2(n_samples_part2, k_range)
-    
-    # Combine datasets
-    combined_dataset = combine_datasets(dataset_part1, dataset_part2)
-    print(f"Combined dataset contains {len(combined_dataset['u_fine'])} samples")
+    # Generate dataset in batches
+    dataset = generate_dataset_in_batches(n_samples_part1, n_samples_part2, k_range, batch_size)
     
     # Verify shapes
-    print(f"Coarse solution shape: {combined_dataset['u_coarse'][0].shape}")
-    print(f"Fine solution shape: {combined_dataset['u_fine'][0].shape}")
+    print(f"Coarse solution shape: {dataset['u_coarse'][0].shape}")
+    print(f"Fine solution shape: {dataset['u_fine'][0].shape}")
     
-    # Save dataset
-    save_dataset(combined_dataset)
-    print("Dataset saved successfully!")
+    # Save dataset in batches
+    save_dataset_in_batches(dataset, batch_size=batch_size)
     
-    # Plot a few samples
-    plot_samples(combined_dataset, n_samples=10)
-    print("Sample plots saved successfully!") 
+    # Plot a few samples (if there are enough samples)
+    n_plot_samples = min(10, len(dataset['u_fine']))
+    if n_plot_samples > 0:
+        plot_samples(dataset, n_samples=n_plot_samples)
+        print(f"Sample plots saved successfully! ({n_plot_samples} samples)")
+    
+    print("Process completed successfully!") 

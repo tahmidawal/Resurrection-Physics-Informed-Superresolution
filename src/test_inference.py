@@ -3,7 +3,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import torch.nn.functional as F
-from src.models_improved import ContextAwareUNet, OverlappingPDEDataset
+import sys
+import os
+
+# Fix import to work whether run from project root or src directory
+try:
+    from src.models_improved import ContextAwareUNet, OverlappingPDEDataset
+except ImportError:
+    from models_improved import ContextAwareUNet, OverlappingPDEDataset
+
 import argparse
 from typing import Dict, List, Tuple
 
@@ -19,17 +27,73 @@ def load_model(checkpoint_path: Path, device: str = 'cuda') -> ContextAwareUNet:
 def load_test_data(data_path: Path, test_indices: List[int], device: str = 'cuda') -> Dict:
     """Load test samples from the dataset."""
     print(f"Loading test data from {data_path} to device {device}")
-    data = np.load(data_path)
-    test_data = {
-        'u_coarse': torch.from_numpy(data['u_coarse'][test_indices]).float().to(device),
-        'u_fine': torch.from_numpy(data['u_fine'][test_indices]).float().to(device),
-        'f_coarse': torch.from_numpy(data['f_coarse'][test_indices]).float().to(device),
-        'f_fine': torch.from_numpy(data['f_fine'][test_indices]).float().to(device),
-        'theta_coarse': torch.from_numpy(data['theta_coarse'][test_indices]).float().to(device),
-        'theta_fine': torch.from_numpy(data['theta_fine'][test_indices]).float().to(device),
-        'k1': torch.from_numpy(data['k1'][test_indices]).float().to(device),
-        'k2': torch.from_numpy(data['k2'][test_indices]).float().to(device)
-    }
+    data_file = np.load(data_path)
+    
+    # Check if data is in batched format
+    keys = list(data_file.keys())
+    print(f"Dataset keys: {keys[:5]}...")  # Print first few keys
+    
+    # Determine if data is in batched format
+    is_batched = any('_batch_' in key for key in keys)
+    print(f"Dataset is in batched format: {is_batched}")
+    
+    if is_batched:
+        # Reconstruct data from batches
+        print("Reconstructing data from batches...")
+        reconstructed_data = {}
+        
+        # Extract batch numbers and data keys
+        batch_info = {}
+        for key in keys:
+            if '_batch_' in key:
+                base_key, batch_num = key.rsplit('_batch_', 1)
+                batch_num = int(batch_num)
+                if base_key not in batch_info:
+                    batch_info[base_key] = []
+                batch_info[base_key].append(batch_num)
+        
+        # Get unique base keys and sort batch numbers
+        base_keys = list(batch_info.keys())
+        for base_key in base_keys:
+            batch_info[base_key] = sorted(batch_info[base_key])
+        
+        print(f"Found base keys: {base_keys}")
+        
+        # Concatenate batches for each base key
+        for base_key in base_keys:
+            batch_data = []
+            for batch_num in batch_info[base_key]:
+                batch_key = f"{base_key}_batch_{batch_num}"
+                batch_data.append(data_file[batch_key])
+            reconstructed_data[base_key] = np.concatenate(batch_data, axis=0)
+            print(f"Reconstructed {base_key}: {reconstructed_data[base_key].shape}")
+        
+        # Add non-batched keys (like k1, k2, etc.)
+        for key in keys:
+            if '_batch_' not in key:
+                reconstructed_data[key] = data_file[key]
+        
+        data = reconstructed_data
+    else:
+        # Normal dataset format
+        data = {key: data_file[key] for key in data_file.keys()}
+    
+    # Select test samples
+    test_data = {}
+    for key in ['u_coarse', 'u_fine', 'f_coarse', 'f_fine', 'theta_coarse', 'theta_fine']:
+        if key in data:
+            test_data[key] = torch.from_numpy(data[key][test_indices]).float().to(device)
+    
+    # Add k1 and k2 if available
+    if 'k1' in data and 'k2' in data:
+        test_data['k1'] = torch.from_numpy(data['k1'][test_indices]).float().to(device) if data['k1'].shape[0] > max(test_indices) else torch.ones(len(test_indices)).to(device)
+        test_data['k2'] = torch.from_numpy(data['k2'][test_indices]).float().to(device) if data['k2'].shape[0] > max(test_indices) else torch.ones(len(test_indices)).to(device)
+    else:
+        # Default values if k1/k2 not available
+        test_data['k1'] = torch.ones(len(test_indices)).to(device) * 8.0
+        test_data['k2'] = torch.ones(len(test_indices)).to(device) * 8.0
+        print("Warning: k1 and k2 not found in dataset, using default values of 8.0")
+    
     return test_data, data
 
 def process_sample(
@@ -43,10 +107,10 @@ def process_sample(
     """Process a single test sample and visualize the results."""
     
     # Prepare input data
-    coarse_solution = test_data['u_coarse'][idx].cpu().numpy()
-    fine_solution = test_data['u_fine'][idx].cpu().numpy()
-    f_coarse = test_data['f_coarse'][idx].cpu().numpy()
-    f_fine = test_data['f_fine'][idx].cpu().numpy()
+    coarse_solution = test_data['u_coarse'][idx].cpu().numpy()  # 24x24
+    fine_solution = test_data['u_fine'][idx].cpu().numpy()      # 48x48
+    f_coarse = test_data['f_coarse'][idx].cpu().numpy()         # 24x24
+    f_fine = test_data['f_fine'][idx].cpu().numpy()             # 48x48
     k1 = test_data['k1'][idx].item()
     k2 = test_data['k2'][idx].item()
     
@@ -60,17 +124,17 @@ def process_sample(
     coarse_norm = (torch.from_numpy(coarse_solution).float() - u_mean) / u_std
     f_coarse_norm = (torch.from_numpy(f_coarse).float() - f_mean) / f_std
     
-    # Upsample coarse inputs to fine grid
+    # Upsample coarse inputs to fine grid (24x24 → 48x48)
     coarse_upsampled = F.interpolate(
         coarse_norm.unsqueeze(0).unsqueeze(0),
-        size=(48, 48),
+        size=(48, 48),  # Full fine grid size with context padding
         mode='bilinear',
         align_corners=True
     )
     
     f_upsampled = F.interpolate(
         f_coarse_norm.unsqueeze(0).unsqueeze(0),
-        size=(48, 48),
+        size=(48, 48),  # Full fine grid size with context padding
         mode='bilinear',
         align_corners=True
     )
@@ -83,25 +147,26 @@ def process_sample(
     
     # Run inference
     with torch.no_grad():
-        prediction = model(model_input)
+        prediction = model(model_input)  # Model outputs 40x40 by removing context padding
         # Manual denormalization to avoid device issues
         prediction = prediction * u_std + u_mean
     
     # Convert to numpy
-    prediction_np = prediction.squeeze().cpu().numpy()
+    prediction_np = prediction.squeeze().cpu().numpy()  # 40x40
     
-    # Bilinear upsampling baseline
+    # Create a bilinear upsampling baseline directly to 40x40 for fair comparison
     bilinear_upsampled = F.interpolate(
         torch.from_numpy(coarse_solution).float().unsqueeze(0).unsqueeze(0),
-        size=(40, 40),
+        size=(40, 40),  # Core size without context padding
         mode='bilinear',
         align_corners=True
     ).squeeze().numpy()
     
-    # Extract core part of fine solution for comparison (40x40)
+    # Extract core part (40x40) of fine solution for comparison
+    # This removes the 4-pixel context padding on each side of the 48x48 fine solution
     h, w = fine_solution.shape
-    start_h = (h - 40) // 2
-    start_w = (w - 40) // 2
+    start_h = (h - 40) // 2  # 4 pixels padding on each side
+    start_w = (w - 40) // 2  # 4 pixels padding on each side
     fine_core = fine_solution[start_h:start_h+40, start_w:start_w+40]
     
     # Calculate errors
@@ -115,6 +180,11 @@ def process_sample(
     fig = plt.figure(figsize=(20, 15))
     plt.suptitle(f'Model Inference Results - Sample {idx}\nk₁={k1:.2f}, k₂={k2:.2f}', fontsize=16)
     
+    # Add explanation of dimensions
+    plt.figtext(0.5, 0.01, 
+                "Note: The model upscales from 24x24 to 48x48, but removes 4-pixel context padding on each side to produce a 40x40 output", 
+                wrap=True, horizontalalignment='center', fontsize=12)
+    
     # Create grid for subplots
     gs = plt.GridSpec(3, 4, figure=fig)
     
@@ -126,29 +196,34 @@ def process_sample(
     
     ax2 = fig.add_subplot(gs[0, 1])
     im2 = ax2.imshow(fine_core)
-    ax2.set_title(f'Ground Truth ({fine_core.shape[0]}×{fine_core.shape[1]})')
+    ax2.set_title(f'Ground Truth (Core {fine_core.shape[0]}×{fine_core.shape[1]})')
     plt.colorbar(im2, ax=ax2)
     
     ax3 = fig.add_subplot(gs[0, 2])
     im3 = ax3.imshow(bilinear_upsampled)
-    ax3.set_title('Bilinear Interpolation')
+    ax3.set_title('Bilinear Interpolation (24×24 → 40×40)')
     plt.colorbar(im3, ax=ax3)
     
     ax4 = fig.add_subplot(gs[0, 3])
     im4 = ax4.imshow(prediction_np)
-    ax4.set_title('ML Model Prediction')
+    ax4.set_title('ML Model Prediction (24×24 → 48×48 → 40×40)')
     plt.colorbar(im4, ax=ax4)
     
-    # Second row: Force field and errors
+    # Also show full fine solution
+    ax1_5 = fig.add_subplot(gs[1, 1])
+    im1_5 = ax1_5.imshow(fine_solution)
+    ax1_5.set_title(f'Full Fine Solution ({fine_solution.shape[0]}×{fine_solution.shape[1]})')
+    plt.colorbar(im1_5, ax=ax1_5)
+    
+    # Highlight core region
+    rect = plt.Rectangle((start_w-0.5, start_h-0.5), 40, 40, linewidth=2, edgecolor='r', facecolor='none')
+    ax1_5.add_patch(rect)
+    
+    # Second row: Force field and errors (shifted by one to make room for full fine solution)
     ax5 = fig.add_subplot(gs[1, 0])
     im5 = ax5.imshow(f_coarse)
     ax5.set_title('Forcing Function (Coarse)')
     plt.colorbar(im5, ax=ax5)
-    
-    ax6 = fig.add_subplot(gs[1, 1])
-    im6 = ax6.imshow(np.zeros_like(fine_core))
-    ax6.set_title('Ground Truth Error (Zero)')
-    plt.colorbar(im6, ax=ax6)
     
     ax7 = fig.add_subplot(gs[1, 2])
     im7 = ax7.imshow(bilinear_error)
@@ -180,7 +255,7 @@ def process_sample(
     ax10.set_title(f'Cross-section at Y={mid_idx}')
     ax10.legend()
     
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Leave space for the explanation text
     plt.savefig(save_dir / f'test_sample_{idx}.png', dpi=300, bbox_inches='tight')
     plt.close()
     
@@ -213,6 +288,7 @@ def main():
             model_path = latest_run / 'best_model.pth'
             if not model_path.exists():
                 model_path = latest_run / 'final_model.pth'
+            print(f"Using latest run: {latest_run}")
         else:
             raise FileNotFoundError("No model found in results directory")
     else:
@@ -233,25 +309,51 @@ def main():
     # Load dataset
     data_path = Path('data/pde_dataset_overlapping.npz')
     
-    # Create test indices - use samples that weren't in training
-    data = np.load(data_path)
-    n_samples = len(data['u_fine'])
-    all_indices = np.arange(n_samples)
+    # Create test indices from the highest quality samples
     np.random.seed(42)  # for reproducibility
+    
+    # Load and reconstruct the entire dataset
+    _, full_data = load_test_data(data_path, [0], device)  # Just pass [0] to get structure without loading all data
+    
+    if 'u_fine' in full_data:
+        n_samples = len(full_data['u_fine'])
+    else:
+        # Find another key with the right shape
+        for key in full_data.keys():
+            if key.startswith('u_fine') or key.startswith('u_coarse'):
+                n_samples = len(full_data[key])
+                break
+        else:
+            raise ValueError("Could not determine dataset size")
+    
+    print(f"Dataset contains {n_samples} samples")
+    
+    # Create test indices - use samples that weren't in training
+    all_indices = np.arange(n_samples)
     test_indices = np.random.choice(all_indices, size=args.num_samples, replace=False)
+    print(f"Selected test indices: {test_indices}")
+    
+    # Load actual test data
+    test_data, full_data = load_test_data(data_path, test_indices, device)
     
     # Create dataset for normalization
     print(f"Creating dataset for normalization on device {device}")
-    dataset = OverlappingPDEDataset(data, device=device)
+    
+    # Prepare a subset of data for the dataset class
+    dataset_data = {}
+    for key in ['u_coarse', 'u_fine', 'f_fine']:
+        if key in full_data:
+            # Only load enough data for normalization statistics
+            sample_indices = np.random.choice(n_samples, min(1000, n_samples), replace=False)
+            dataset_data[key] = full_data[key][sample_indices]
+    
+    dataset = OverlappingPDEDataset(dataset_data, device=device)
     
     # Get the dataset statistics to CPU to avoid device issues
     dataset.u_mean = dataset.u_mean.cpu()
     dataset.u_std = dataset.u_std.cpu()
     dataset.f_mean = dataset.f_mean.cpu()
     dataset.f_std = dataset.f_std.cpu()
-    
-    # Load test data
-    test_data, _ = load_test_data(data_path, test_indices, device)
     
     # Process each test sample
     mae_bilinear = []

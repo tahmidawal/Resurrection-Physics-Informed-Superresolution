@@ -233,16 +233,35 @@ class OverlappingPDEDataset(torch.utils.data.Dataset):
         self.coarse_padding = (context_size[0] - core_size[0]) // 2
         self.fine_padding = (context_size[1] - core_size[1]) // 2
         
+        # Check if the expected keys exist or find alternative keys
+        print("Checking dataset keys...")
+        if 'u_coarse' in data_dict:
+            coarse_key = 'u_coarse'
+            fine_key = 'u_fine'
+            f_fine_key = 'f_fine'
+        else:
+            # Look for alternative keys
+            coarse_key = next((k for k in data_dict.keys() if k.startswith('u_coarse')), None)
+            fine_key = next((k for k in data_dict.keys() if k.startswith('u_fine')), None)
+            f_fine_key = next((k for k in data_dict.keys() if k.startswith('f_fine')), None)
+            
+            if not all([coarse_key, fine_key, f_fine_key]):
+                raise KeyError(f"Required dataset keys not found. Available keys: {list(data_dict.keys())}")
+            
+            print(f"Using alternative keys: {coarse_key}, {fine_key}, {f_fine_key}")
+        
         # Convert numpy arrays to tensors and move to device
-        self.u_coarse = torch.from_numpy(data_dict['u_coarse']).float().to(device)  # Shape: [N, 24, 24]
-        self.u_fine = torch.from_numpy(data_dict['u_fine']).float().to(device)      # Shape: [N, 48, 48]
-        self.f_fine = torch.from_numpy(data_dict['f_fine']).float().to(device)      # Shape: [N, 48, 48]
+        self.u_coarse = torch.from_numpy(data_dict[coarse_key]).float().to(device)  # Shape: [N, 24, 24]
+        self.u_fine = torch.from_numpy(data_dict[fine_key]).float().to(device)      # Shape: [N, 48, 48]
+        self.f_fine = torch.from_numpy(data_dict[f_fine_key]).float().to(device)    # Shape: [N, 48, 48]
         
         # Compute normalization statistics
         self.u_mean = self.u_fine.mean()
         self.u_std = self.u_fine.std()
         self.f_mean = self.f_fine.mean()
         self.f_std = self.f_fine.std()
+        
+        print(f"Dataset stats: u_mean={self.u_mean.item():.4f}, u_std={self.u_std.item():.4f}, f_mean={self.f_mean.item():.4f}, f_std={self.f_std.item():.4f}")
         
         # Normalize the data
         self.u_fine_norm = (self.u_fine - self.u_mean) / self.u_std

@@ -9,8 +9,14 @@ from datetime import datetime
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
+import sys
+import os
 
-from src.models_improved import ContextAwareUNet, OverlappingPDEDataset, init_weights, BoundaryAttentionModule
+# Fix import to work whether run from project root or src directory
+try:
+    from src.models_improved import ContextAwareUNet, OverlappingPDEDataset, init_weights, BoundaryAttentionModule
+except ImportError:
+    from models_improved import ContextAwareUNet, OverlappingPDEDataset, init_weights, BoundaryAttentionModule
 
 # Define a custom loss function that focuses more on boundaries
 class BoundaryAwareLoss(nn.Module):
@@ -383,10 +389,73 @@ def main():
     
     # Load data
     print("Loading dataset...")
-    data = np.load('data/pde_dataset_overlapping.npz')
+    data_file = np.load('data/pde_dataset_overlapping.npz')
+    
+    # Check if data is in batched format
+    keys = list(data_file.keys())
+    print(f"Dataset keys: {keys[:5]}...")  # Print first few keys
+    
+    # Determine if data is in batched format
+    is_batched = any('_batch_' in key for key in keys)
+    print(f"Dataset is in batched format: {is_batched}")
+    
+    if is_batched:
+        # Reconstruct data from batches
+        print("Reconstructing data from batches...")
+        reconstructed_data = {}
+        
+        # Extract batch numbers and data keys
+        batch_info = {}
+        for key in keys:
+            if '_batch_' in key:
+                base_key, batch_num = key.rsplit('_batch_', 1)
+                batch_num = int(batch_num)
+                if base_key not in batch_info:
+                    batch_info[base_key] = []
+                batch_info[base_key].append(batch_num)
+        
+        # Get unique base keys and sort batch numbers
+        base_keys = list(batch_info.keys())
+        for base_key in base_keys:
+            batch_info[base_key] = sorted(batch_info[base_key])
+        
+        print(f"Found base keys: {base_keys}")
+        print(f"Batch numbers: {[batch_info[base_keys[0]]]}")
+        
+        # Concatenate batches for each base key
+        for base_key in base_keys:
+            batch_data = []
+            for batch_num in batch_info[base_key]:
+                batch_key = f"{base_key}_batch_{batch_num}"
+                batch_data.append(data_file[batch_key])
+            reconstructed_data[base_key] = np.concatenate(batch_data, axis=0)
+            print(f"Reconstructed {base_key}: {reconstructed_data[base_key].shape}")
+        
+        # Add non-batched keys (like k1, k2, etc.)
+        for key in keys:
+            if '_batch_' not in key:
+                reconstructed_data[key] = data_file[key]
+        
+        data = reconstructed_data
+    else:
+        # Normal dataset format
+        data = {key: data_file[key] for key in data_file.keys()}
     
     # Create a random permutation of indices
-    n_samples = len(data['u_fine'])
+    if 'u_fine' in data:
+        n_samples = len(data['u_fine'])
+    else:
+        # If u_fine is not available, try to use another data key
+        for key in data.keys():
+            if key.startswith('u_fine'):
+                n_samples = len(data[key])
+                break
+        else:
+            # If no u_fine or u_fine_batch_* keys found
+            sample_key = list(data.keys())[0]
+            n_samples = len(data[sample_key])
+            print(f"Using {sample_key} for sample count: {n_samples}")
+    
     indices = np.random.permutation(n_samples)
     
     # Split indices into train and validation
@@ -395,11 +464,26 @@ def main():
     val_indices = indices[:val_size]
     
     # Create train and validation datasets with the split indices
-    train_data = {key: data[key][train_indices] for key in data.files}
-    val_data = {key: data[key][val_indices] for key in data.files}
+    train_data = {}
+    val_data = {}
+    
+    # Only add data arrays with the right shape (exclude 'k1', 'k2', 'total_samples', etc.)
+    for key in data.keys():
+        if isinstance(data[key], np.ndarray):
+            # Check if the array has the correct first dimension
+            if data[key].shape and data[key].shape[0] == n_samples:
+                # These are the main data arrays (u_coarse, u_fine, etc.)
+                train_data[key] = data[key][train_indices]
+                val_data[key] = data[key][val_indices]
+            else:
+                # These might be metadata like k1, k2 - we'll skip them for datasets
+                print(f"Skipping key {key} with shape {data[key].shape} for train/val split")
     
     print(f"Training samples: {len(train_indices)}")
     print(f"Validation samples: {len(val_indices)}")
+    
+    # Debug: Print keys in train_data to verify
+    print(f"Keys in train_data: {list(train_data.keys())}")
     
     # Create datasets
     train_dataset = OverlappingPDEDataset(
